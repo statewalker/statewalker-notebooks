@@ -1,4 +1,10 @@
 export { copyAttachments } from "./assets.js";
+export {
+  type NotebookBuild,
+  type NotebookBuildOptions,
+  type NotebookFailure,
+  newNotebookBuild,
+} from "./build.js";
 export { ASSET_EXTENSIONS, type ModuleServerLike, materializeDeps } from "./deps.js";
 export { parseMarkdown } from "./md-parse.js";
 export { parseNotebookHtml } from "./parse.js";
