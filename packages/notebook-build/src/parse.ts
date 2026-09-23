@@ -2,7 +2,9 @@ import { deserialize, type Notebook, toNotebook } from "@observablehq/notebook-k
 import type { DomEnv } from "./serialize.js";
 
 export function parseNotebookHtml(html: string, dom: DomEnv): Notebook {
-  // deserialize returns a NotebookSpec; toNotebook fills every default so
-  // downstream stages never branch on an absent field.
+  // deserialize already returns a fully-normalized Notebook (it calls toNotebook
+  // internally). The outer toNotebook here is a harmless idempotent second pass,
+  // kept for explicitness so downstream stages never have to trust that an
+  // upstream default was actually applied.
   return toNotebook(deserialize(html, { parser: dom.parser }));
 }

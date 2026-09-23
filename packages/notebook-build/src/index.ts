@@ -2,6 +2,7 @@ export { parseMarkdown } from "./md-parse.js";
 export { parseNotebookHtml } from "./parse.js";
 export {
   collectSpecifiers,
+  isNpmSpecifier,
   type ModuleRef,
   type ModuleResolver,
   type PinMap,

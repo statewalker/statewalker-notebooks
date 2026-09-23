@@ -41,6 +41,11 @@ describe("toModuleRef", () => {
   it("handles a bare name", () => {
     expect(toModuleRef("d3")).toEqual({ pkg: "d3" });
   });
+  it("throws for a specifier that is not an npm specifier", () => {
+    expect(() => toModuleRef("https://esm.sh/d3")).toThrow();
+    expect(() => toModuleRef("./helper.js")).toThrow();
+    expect(() => toModuleRef("jsr:@std/path")).toThrow();
+  });
 });
 
 describe("resolveNotebook", () => {
@@ -96,5 +101,41 @@ describe("resolveNotebook", () => {
     );
     expect(a.get("npm:d3@6")).toBe("/_m/d3@6/index.js");
     expect(b.get("npm:d3@7")).toBe("/_m/d3@7/index.js");
+  });
+
+  it("does not pin a URL import and does not throw", async () => {
+    const nb = nbWith(`import * as d3 from "https://esm.sh/d3";`);
+    const pins = await resolveNotebook(nb, { moduleServer: fakeServer({}) }, "/n/a.md");
+    expect(pins.size).toBe(0);
+  });
+
+  it("does not pin a relative import and does not throw", async () => {
+    const nb = nbWith(`import { helper } from "./helper.js";`);
+    const pins = await resolveNotebook(nb, { moduleServer: fakeServer({}) }, "/n/a.md");
+    expect(pins.size).toBe(0);
+  });
+
+  it("does not pin a jsr: import and does not throw", async () => {
+    const nb = nbWith(`import { join } from "jsr:@std/path";`);
+    const pins = await resolveNotebook(nb, { moduleServer: fakeServer({}) }, "/n/a.md");
+    expect(pins.size).toBe(0);
+  });
+
+  it("does not pin an observable: import and does not throw", async () => {
+    const nb = nbWith(`import { foo } from "observable:@user/nb";`);
+    const pins = await resolveNotebook(nb, { moduleServer: fakeServer({}) }, "/n/a.md");
+    expect(pins.size).toBe(0);
+  });
+
+  it("pins only the npm import in a notebook that mixes an npm and a URL import", async () => {
+    const nb = nbWith(`import {csv} from "d3";`, `import * as Plot from "https://esm.sh/plot";`);
+    const pins = await resolveNotebook(
+      nb,
+      { moduleServer: fakeServer({ d3: "/_m/d3.js" }) },
+      "/n/a.md",
+    );
+    expect(pins.get("d3")).toBe("/_m/d3.js");
+    expect(pins.has("https://esm.sh/plot")).toBe(false);
+    expect(pins.size).toBe(1);
   });
 });

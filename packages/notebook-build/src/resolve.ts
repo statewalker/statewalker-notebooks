@@ -52,8 +52,25 @@ export function collectSpecifiers(nb: Notebook): string[] {
   return [...seen];
 }
 
+/**
+ * True for a bare name (`d3`, `@scope/pkg`) or an `npm:`-prefixed specifier — the only shapes
+ * `toModuleRef` parses. False for a URL (`https://esm.sh/d3`), a relative or absolute path
+ * (`./helper.js`, `/x.js`), or any other protocol-prefixed specifier notebook-kit understands
+ * natively (`jsr:`, `observable:`, `data:`, `node:`, …). Those are left for the browser or
+ * notebook-kit's own runtime to handle unchanged; feeding them to `toModuleRef` would mangle
+ * them into a bogus `ModuleRef` and send webrun-modules after the wrong package.
+ */
+export function isNpmSpecifier(specifier: string): boolean {
+  if (specifier.startsWith("npm:")) return true;
+  if (specifier.startsWith(".") || specifier.startsWith("/")) return false;
+  if (specifier.includes("://")) return false;
+  const protocol = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.exec(specifier)?.[0];
+  return protocol === undefined;
+}
+
 /** `npm:@scope/pkg@1.2.3/sub` -> {pkg, version, subpath}. */
 export function toModuleRef(specifier: string): ModuleRef {
+  if (!isNpmSpecifier(specifier)) throw new Error(`not an npm specifier: ${specifier}`);
   const bare = specifier.startsWith("npm:") ? specifier.slice(4) : specifier;
   const m = /^((?:@[^/]+\/)?[^/@]+)(?:@([^/]+))?(?:\/(.*))?$/.exec(bare);
   if (!m) throw new Error(`unparseable specifier: ${specifier}`);
@@ -71,6 +88,7 @@ export async function resolveNotebook(
 ): Promise<PinMap> {
   const pins = new Map<string, string>();
   for (const specifier of collectSpecifiers(nb)) {
+    if (!isNpmSpecifier(specifier)) continue;
     try {
       const { url } = await moduleServer.resolve(toModuleRef(specifier));
       pins.set(specifier, url);
