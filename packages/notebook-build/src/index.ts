@@ -1,5 +1,6 @@
 export { parseMarkdown } from "./md-parse.js";
 export { parseNotebookHtml } from "./parse.js";
+export { type RenderOptions, renderPage } from "./render.js";
 export {
   collectSpecifiers,
   isNpmSpecifier,
