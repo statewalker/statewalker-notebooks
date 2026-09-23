@@ -3,7 +3,7 @@ import { parseMarkdown } from "./md-parse.js";
 import { collectSpecifiers, ResolveError, resolveNotebook, toModuleRef } from "./resolve.js";
 
 const nbWith = (...blocks: string[]) =>
-  parseMarkdown(`# T\n\n${blocks.map((b) => "```js\n" + b + "\n```").join("\n\n")}\n`);
+  parseMarkdown(`# T\n\n${blocks.map((b) => `\`\`\`js\n${b}\n\`\`\``).join("\n\n")}\n`);
 
 describe("collectSpecifiers", () => {
   it("finds static, namespace and dynamic imports across all cells", () => {
