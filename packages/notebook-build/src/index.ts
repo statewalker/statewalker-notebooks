@@ -1,4 +1,5 @@
 export { copyAttachments } from "./assets.js";
+export { ASSET_EXTENSIONS, type ModuleServerLike, materializeDeps } from "./deps.js";
 export { parseMarkdown } from "./md-parse.js";
 export { parseNotebookHtml } from "./parse.js";
 export { type RenderOptions, renderPage } from "./render.js";
