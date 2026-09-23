@@ -55,6 +55,7 @@ const build = (
     onRebuilt?: (changed: string[]) => void;
     moduleServer?: ModuleServerLike;
     mode?: "hosted" | "static";
+    stylesUrl?: string;
   } = {},
 ) =>
   newNotebookBuild({
@@ -65,6 +66,7 @@ const build = (
     dom: nodeDom(),
     mode: extra.mode ?? "hosted",
     ...(extra.onRebuilt ? { onRebuilt: extra.onRebuilt } : {}),
+    ...(extra.stylesUrl ? { stylesUrl: extra.stylesUrl } : {}),
   });
 
 describe("newNotebookBuild", () => {
@@ -101,6 +103,31 @@ describe("newNotebookBuild", () => {
         dom: nodeDom(),
       }),
     ).toThrow(/distinct/);
+  });
+
+  it("refuses an output that is the cache itself", () => {
+    // The sidecars (`.nb.html`, `.hash`, `.outputs.json`) would be published into the
+    // static site, so all three must really be distinct — not just two of the pairs.
+    const shared = new MemFilesApi();
+    expect(() =>
+      newNotebookBuild({
+        notebooks: new MemFilesApi(),
+        output: shared,
+        cache: shared,
+        moduleServer: fakeServer().server,
+        dom: nodeDom(),
+      }),
+    ).toThrow(/distinct/);
+  });
+
+  it("puts the stylesheet on the page when one is configured", async () => {
+    const notebooks = new MemFilesApi();
+    await writeText(notebooks, "/n.md", "# N\n\n```js\nconst x = 1;\n```\n");
+    const output = new MemFilesApi();
+    await build(notebooks, output, { stylesUrl: "/_m/notebook-kit@1/index.css" }).build();
+    expect(await readText(output, "/n.html")).toContain(
+      '<link rel="stylesheet" href="/_m/notebook-kit@1/index.css">',
+    );
   });
 
   it("does not run the deps stage in hosted mode", async () => {

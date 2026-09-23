@@ -75,6 +75,12 @@ export interface NotebookBuildOptions {
   mode?: "hosted" | "static";
   /** URL prefix the module server serves packages under (default `/_m/`). */
   basePath?: string;
+  /**
+   * Stylesheet the rendered pages link. Left unset the pages carry no styles at all,
+   * which is rarely what a shipped site wants; a hosted setup normally points this at
+   * the module server's copy of notebook-kit's CSS.
+   */
+  stylesUrl?: string;
   /** Called once per converged build with the output paths that changed, if any. */
   onRebuilt?: (changed: string[]) => void;
   /** Called once per converged build with the notebooks that failed, if any. */
@@ -102,6 +108,7 @@ interface Host {
   dom: DomEnv;
   mode: "hosted" | "static";
   basePath: string;
+  stylesUrl?: string;
   /** Output paths written during the current `build()`. */
   changed: Set<string>;
   failures: NotebookFailure[];
@@ -176,10 +183,22 @@ function runtimeUrlOf(host: Host): Promise<string> {
 /**
  * Render one notebook out of its serialized artifact.
  *
- * Ordering is load-bearing: everything that can throw for a notebook-specific reason
- * (`resolveNotebook`, `copyAttachments`) runs before the page is written, and the hash
- * sidecar is written last — so a notebook that failed carries no "already built" record
- * and is retried the next time its source is scanned.
+ * Ordering is load-bearing in two separate ways, and the two pull in opposite
+ * directions:
+ *
+ * 1. The MANIFEST is written as early as it can be complete — immediately after the
+ *    page write, with `deps: []` — and rewritten once the closure is materialized.
+ *    Recording it only at the end means a `[Deps]` failure (a transient
+ *    `listResources`, say) leaves the page and its attachments in `output` with
+ *    nothing recording them: a later deletion cannot prune what no manifest mentions,
+ *    and the output grows for ever.
+ * 2. The HASH sidecar is written last, and never by `[Notebook]`. It is the record
+ *    "this exact serialization was successfully rendered". Recording it at
+ *    serialization time makes an edit that failed to render look already-built, so a
+ *    retry with the same bytes is skipped and the previous version serves for ever.
+ *
+ * Everything that throws for a notebook-specific reason (`resolveNotebook`,
+ * `copyAttachments`) still runs before anything is written at all.
  */
 async function emitPage(host: Host, uri: string): Promise<void> {
   const notebookPath = sourcePath(uri);
@@ -188,26 +207,32 @@ async function emitPage(host: Host, uri: string): Promise<void> {
 
   const pins = await resolveNotebook(nb, { moduleServer: host.moduleServer }, notebookPath);
   const runtimeUrl = await runtimeUrlOf(host);
-  const page = renderPage(nb, transpileNotebook(nb, pins), { runtimeUrl });
+  const page = renderPage(nb, transpileNotebook(nb, pins), {
+    runtimeUrl,
+    ...(host.stylesUrl === undefined ? {} : { stylesUrl: host.stylesUrl }),
+  });
   const assets = await copyAttachments(nb, host.notebooks, host.output, notebookPath);
 
   const pagePathOf = pagePath(uri);
   await writeText(host.output, pagePathOf, page);
+  await writeManifest(host, uri, { page: pagePathOf, assets, deps: [] });
 
-  const deps =
-    host.mode === "static"
-      ? await materializeDeps(
-          new Map([...pins, [RUNTIME_SPECIFIER, runtimeUrl]]) as PinMap,
-          host.moduleServer,
-          host.output,
-          host.basePath,
-        )
-      : [];
+  if (host.mode === "static") {
+    const deps = await materializeDeps(
+      new Map([...pins, [RUNTIME_SPECIFIER, runtimeUrl]]) as PinMap,
+      host.moduleServer,
+      host.output,
+      host.basePath,
+    );
+    await writeManifest(host, uri, { page: pagePathOf, assets, deps });
+  }
 
-  const manifest: Manifest = { page: pagePathOf, assets, deps };
-  await writeText(host.cache, sidecarPath(uri, MANIFEST_SUFFIX), JSON.stringify(manifest));
   await writeText(host.cache, sidecarPath(uri, HASH_SUFFIX), await notebookHash(serialized));
   for (const path of [pagePathOf, ...assets]) host.changed.add(path);
+}
+
+function writeManifest(host: Host, uri: string, manifest: Manifest): Promise<void> {
+  return writeText(host.cache, sidecarPath(uri, MANIFEST_SUFFIX), JSON.stringify(manifest));
 }
 
 /**
@@ -341,7 +366,7 @@ export function newNotebookBuild(options: NotebookBuildOptions): NotebookBuild {
   // The engine scans `notebooks` and keeps its own state there; the sidecars live in
   // `cache` and the pages in `output`. Sharing an instance would feed generated files
   // back in as sources.
-  if (notebooks === cache || notebooks === output) {
+  if (notebooks === cache || notebooks === output || output === cache) {
     throw new Error(
       "newNotebookBuild: `notebooks`, `output` and `cache` must be distinct FilesApi instances",
     );
@@ -355,6 +380,7 @@ export function newNotebookBuild(options: NotebookBuildOptions): NotebookBuild {
     dom: options.dom,
     mode: options.mode ?? "static",
     basePath: options.basePath ?? DEFAULT_BASE_PATH,
+    ...(options.stylesUrl === undefined ? {} : { stylesUrl: options.stylesUrl }),
     changed: new Set<string>(),
     failures: [] as NotebookFailure[],
   } as Host;

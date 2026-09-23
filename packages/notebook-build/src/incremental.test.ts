@@ -69,7 +69,11 @@ async function seed() {
 const build = (
   notebooks: FilesApi,
   output: FilesApi,
-  extra: { moduleServer?: ModuleServerLike; onFailed?: (f: NotebookFailure[]) => void } = {},
+  extra: {
+    moduleServer?: ModuleServerLike;
+    onFailed?: (f: NotebookFailure[]) => void;
+    mode?: "hosted" | "static";
+  } = {},
 ) =>
   newNotebookBuild({
     notebooks,
@@ -77,7 +81,7 @@ const build = (
     cache: new MemFilesApi(),
     moduleServer: extra.moduleServer ?? fakeServer(),
     dom: nodeDom(),
-    mode: "hosted",
+    mode: extra.mode ?? "hosted",
     ...(extra.onFailed ? { onFailed: extra.onFailed } : {}),
   });
 
@@ -211,5 +215,110 @@ describe("newNotebookBuild — incremental", () => {
     await writeText(notebooks, "/n.md", '# N\n\n```js\nimport x from "npm:flaky";\n```\n');
     await b.build();
     expect(await output.exists("/n.html")).toBe(true);
+  });
+
+  it("does not serve a stale page after a failed edit is retried", async () => {
+    const notebooks = new MemFilesApi();
+    await writeText(notebooks, "/n.md", '# V1\n\n```js\nimport x from "npm:flaky";\n```\n');
+    const output = new MemFilesApi();
+    let broken = false;
+    const server: ModuleServerLike = {
+      ...fakeServer(),
+      resolve: async (ref: ModuleRef) => {
+        if (broken) throw new Error("registry down");
+        return { url: `/_m/${ref.pkg}@1/index.js`, target: "browser" };
+      },
+    };
+    const b = build(notebooks, output, { moduleServer: server });
+    await b.build();
+    expect(await readText(output, "/n.html")).toContain("V1");
+
+    // v2 is authored while the server is down: the render fails and v1 keeps serving.
+    broken = true;
+    await tick();
+    await writeText(notebooks, "/n.md", '# V2\n\n```js\nimport x from "npm:flaky";\n```\n');
+    await b.build();
+    expect(await readText(output, "/n.html")).toContain("V1");
+
+    // The server recovers and the source is touched with the SAME v2 bytes. Recording
+    // the hash when the notebook is serialized rather than when it is rendered makes
+    // this look already-built — and /n.html would serve v1 for ever.
+    broken = false;
+    await tick();
+    await writeText(notebooks, "/n.md", '# V2\n\n```js\nimport x from "npm:flaky";\n```\n');
+    await b.build();
+    expect(await readText(output, "/n.html")).toContain("V2");
+    expect(await readText(output, "/n.html")).not.toContain("V1");
+  });
+
+  it("skips a source edit that serializes to the same notebook", async () => {
+    const notebooks = new MemFilesApi();
+    const store = new MemFilesApi();
+    const { api: output, writes } = recordingFiles(store);
+    await writeText(notebooks, "/n.md", "# N\n\n```js\nconst x = 1;\n```\n");
+    const b = build(notebooks, output);
+    await b.build();
+
+    writes.length = 0;
+    await tick();
+    // Different bytes, same notebook: an extra blank line before the fence and a
+    // trailing space on the heading are both dropped by the Markdown parse, so the
+    // serialized document — what the gate hashes — is byte-identical. A gate that
+    // hashed the SOURCE would re-render here.
+    await writeText(notebooks, "/n.md", "# N \n\n\n```js\nconst x = 1;\n```\n");
+    await b.build();
+
+    expect(writes).not.toContain("/n.html");
+  });
+
+  it("prunes outputs recorded before a later stage failed", async () => {
+    const notebooks = new MemFilesApi();
+    const output = new MemFilesApi();
+    await writeText(notebooks, "/n.md", '# N\n\n```js\nFileAttachment("d.csv");\n```\n');
+    await writeText(notebooks, "/d.csv", "a\n");
+    // A transient closure failure: resolution works, materializing it does not. The page
+    // and its attachment are already written by then.
+    const server: ModuleServerLike = {
+      ...fakeServer(),
+      listResources: async () => {
+        throw new Error("closure unavailable");
+      },
+    };
+    const b = build(notebooks, output, { moduleServer: server, mode: "static" });
+    await b.build();
+    expect(await output.exists("/n.html")).toBe(true);
+    expect(await output.exists("/d.csv")).toBe(true);
+
+    await tick();
+    await notebooks.remove("/n.md");
+    await b.build();
+
+    // Nothing records an output that no manifest mentions, so it would live in the
+    // output for ever.
+    expect(await output.exists("/n.html")).toBe(false);
+    expect(await output.exists("/d.csv")).toBe(false);
+  });
+
+  it("prunes the dependency closure of the last notebook that needed it", async () => {
+    const notebooks = new MemFilesApi();
+    const output = new MemFilesApi();
+    await writeText(notebooks, "/n.md", '# N\n\n```js\nimport * as d3 from "d3";\n```\n');
+    const server: ModuleServerLike = {
+      ...fakeServer(),
+      listResources: async (ref: ModuleRef) => [`/_m/${ref.pkg}@1/index.js`],
+      fetch: async () => new Response("//module\n", { status: 200 }),
+    };
+    const b = build(notebooks, output, { moduleServer: server, mode: "static" });
+    await b.build();
+    expect(await output.exists("/_m/d3@1/index.js")).toBe(true);
+    expect(await output.exists("/_m/@observablehq/notebook-kit@1/index.js")).toBe(true);
+
+    await tick();
+    await notebooks.remove("/n.md");
+    await b.build();
+
+    expect(await output.exists("/n.html")).toBe(false);
+    expect(await output.exists("/_m/d3@1/index.js")).toBe(false);
+    expect(await output.exists("/_m/@observablehq/notebook-kit@1/index.js")).toBe(false);
   });
 });
