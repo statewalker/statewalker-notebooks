@@ -1,0 +1,9 @@
+{
+  // `test-browser/` contains code that runs inside the page (`page.evaluate`) as well as Node
+  // code, and it may read `document` as a bare global there — which `src/no-dom-globals.test.ts`
+  // forbids for every shipped source file. Its own project keeps that separation explicit, and
+  // it IS checked: `pnpm typecheck` runs both.
+  "extends": "./tsconfig.json",
+  "include": ["./test-browser", "./*.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

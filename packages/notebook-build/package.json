@@ -20,7 +20,8 @@
     "build": "tsdown",
     "prepack": "pnpm run build",
     "test": "pnpm run build && vitest run --passWithNoTests",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test-browser.json",
+    "test:browser": "vitest run test-browser --config vitest.browser.config.ts"
   },
   "dependencies": {
     "@observablehq/notebook-kit": "^2.6.4",
@@ -28,9 +29,11 @@
   },
   "devDependencies": {
     "@statewalker/webrun-files-mem": "workspace:*",
+    "@statewalker/webrun-files-node": "workspace:*",
     "@types/jsdom": "catalog:",
     "@types/markdown-it": "catalog:",
     "jsdom": "catalog:",
+    "playwright": "^1.63.0",
     "tsdown": "^0.23.0",
     "typescript": "^7.0.2",
     "vitest": "^5.0.1"
