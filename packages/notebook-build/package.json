@@ -27,6 +27,7 @@
     "markdown-it": "catalog:"
   },
   "devDependencies": {
+    "@statewalker/webrun-files-mem": "catalog:",
     "@types/jsdom": "catalog:",
     "@types/markdown-it": "catalog:",
     "jsdom": "catalog:",
