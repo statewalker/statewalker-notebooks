@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const SRC_DIR = dirname(fileURLToPath(import.meta.url));
-const GLOBAL_DOM_NAMES = ["document", "window", "localStorage", "navigator"];
+const GLOBAL_DOM_NAMES = ["document", "window", "localStorage", "navigator", "globalThis"];
 
 /**
  * Recursively collect every `.ts` file under `dir`, skipping tests: this guard is about what
@@ -30,6 +30,16 @@ function sourceFiles(dir: string): string[] {
  * under a real Node build, or vice versa; no unit test in this suite would notice on its own,
  * because vitest runs in only one environment at a time. See the `DomEnv` doc comment in
  * `serialize.ts`.
+ *
+ * `globalThis` is itself in the flagged list, not just `document`/`window`/etc: without it,
+ * `globalThis.document` passes as if it were `dom.document`, because the character before
+ * `document` is still `.`. That is the exact evasion a code review found against the first
+ * version of this guard — and it typechecks, since `lib` now includes `DOM`. Flagging
+ * `globalThis` catches that specific, unremarkable shape (a careless `globalThis.foo` creeping
+ * back in) cheaply. It does NOT catch a deliberately obfuscated alias chain — e.g.
+ * `const g: any = globalThis; g.document.title` — that is a much higher bar (this is a
+ * regex-based lint, not a data-flow analysis) and is out of scope: the guard's job is to stop
+ * an accidental regression, not a hostile one.
  */
 
 // Strip block and line comments first, so prose that merely mentions one of these words (e.g.
