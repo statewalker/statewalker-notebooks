@@ -42,17 +42,145 @@ function sourceFiles(dir: string): string[] {
  * an accidental regression, not a hostile one.
  */
 
-// Strip block and line comments first, so prose that merely mentions one of these words (e.g.
-// "the whole document") doesn't trip the scan below. Good enough for a lint-style guard, not a
-// full parser: it doesn't account for these sequences appearing inside string/template
-// literals, which none of this package's sources currently do.
-function stripComments(source: string): string {
-  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+/**
+ * Blanks comments and the *literal text* of string/template literals, in a single pass, so
+ * prose that merely mentions one of these words (e.g. "the whole document") doesn't trip the
+ * scan below, and neither does browser vocabulary a module deliberately builds as a *string* to
+ * hand to a browser later (e.g. a page-rendering stage emitting `` `document.getElementById(...)`
+ * `` as text it never executes itself). A `${...}` interpolation inside a template literal is
+ * left in place and still scanned, because that part really is code that runs here, in Node, at
+ * string-build time — `` `${document.title}` `` must still be caught.
+ *
+ * This has to be one combined scanner, not comment-stripping followed by a separate
+ * literal-stripping pass: a naive two-pass composition breaks on a string containing `//`, e.g.
+ * `specifier.includes("://")` (this package has exactly this, in resolve.ts). The line-comment
+ * half of a naive `stripComments` doesn't know it's inside a string, so it treats the `//` in
+ * `"://"` as a real comment start and truncates the line — including the string's closing quote.
+ * That leaves a dangling, unmatched `"` in the "comment-stripped" text; a literal-stripping pass
+ * run afterwards treats everything from that dangling quote onward as string content, up to the
+ * next unrelated `"` in the file — silently blanking real code in between, including any
+ * `document`/`window`/etc it contains. Scanning comments and literals together avoids this: a
+ * `//` is only ever treated as a comment when the scanner isn't already inside a string.
+ *
+ * Still a lint-style guard, not a full parser: it does not understand regex literals containing
+ * quote-like characters, which no source in this package currently has.
+ */
+function stripNonCode(source: string): string {
+  const out: string[] = [];
+  let i = 0;
+  const n = source.length;
+
+  const blank = (ch: string) => out.push(ch === "\n" ? "\n" : " ");
+
+  function consumeLineComment(): void {
+    while (i < n && source[i] !== "\n") {
+      blank(source[i] as string);
+      i++;
+    }
+  }
+
+  function consumeBlockComment(): void {
+    blank(" ");
+    blank(" ");
+    i += 2; // "/*"
+    while (i < n && !(source[i] === "*" && source[i + 1] === "/")) {
+      blank(source[i] as string);
+      i++;
+    }
+    if (i < n) {
+      blank(" ");
+      blank(" ");
+      i += 2; // "*/"
+    }
+  }
+
+  function consumeQuoted(quote: string): void {
+    blank(" ");
+    i++; // opening quote
+    while (i < n && source[i] !== quote) {
+      if (source[i] === "\\" && i + 1 < n) {
+        blank(" ");
+        blank(source[i + 1] as string);
+        i += 2;
+      } else {
+        blank(source[i] as string);
+        i++;
+      }
+    }
+    if (i < n) {
+      blank(" ");
+      i++; // closing quote
+    }
+  }
+
+  // Inside a template literal's `${...}` interpolation: this is live code (it runs in Node
+  // while the page string is being built), so it is emitted as-is, not blanked — but it can
+  // itself contain nested comments, strings, or templates, which still need the same treatment.
+  function consumeInterpolation(): void {
+    let depth = 1;
+    while (i < n && depth > 0) {
+      const c = source[i] as string;
+      if (c === "/" && source[i + 1] === "/") consumeLineComment();
+      else if (c === "/" && source[i + 1] === "*") consumeBlockComment();
+      else if (c === "`") consumeTemplate();
+      else if (c === '"' || c === "'") consumeQuoted(c);
+      else if (c === "{") {
+        depth++;
+        out.push(c);
+        i++;
+      } else if (c === "}") {
+        depth--;
+        if (depth === 0) blank(" ");
+        else out.push(c);
+        i++;
+      } else {
+        out.push(c);
+        i++;
+      }
+    }
+  }
+
+  function consumeTemplate(): void {
+    blank(" ");
+    i++; // opening backtick
+    while (i < n && source[i] !== "`") {
+      if (source[i] === "\\" && i + 1 < n) {
+        blank(" ");
+        blank(source[i + 1] as string);
+        i += 2;
+      } else if (source[i] === "$" && source[i + 1] === "{") {
+        blank(" ");
+        blank(" ");
+        i += 2; // "${"
+        consumeInterpolation();
+      } else {
+        blank(source[i] as string);
+        i++;
+      }
+    }
+    if (i < n) {
+      blank(" ");
+      i++; // closing backtick
+    }
+  }
+
+  while (i < n) {
+    const c = source[i] as string;
+    if (c === "/" && source[i + 1] === "/") consumeLineComment();
+    else if (c === "/" && source[i + 1] === "*") consumeBlockComment();
+    else if (c === '"' || c === "'") consumeQuoted(c);
+    else if (c === "`") consumeTemplate();
+    else {
+      out.push(c);
+      i++;
+    }
+  }
+  return out.join("");
 }
 
 function findGlobalDomReferences(source: string): string[] {
   const hits: string[] = [];
-  const code = stripComments(source);
+  const code = stripNonCode(source);
   const pattern = new RegExp(`\\b(${GLOBAL_DOM_NAMES.join("|")})\\b`, "g");
   let match: RegExpExecArray | null = pattern.exec(code);
   while (match !== null) {

@@ -37,14 +37,9 @@ function renderCellRoot(id: number, inner: string): string {
  * `@observablehq/notebook-kit`): `{root, variables, expanded}` exactly, nothing more and nothing
  * renamed — `display.js` reads `state.root`/`state.variables`/`state.expanded` directly, so any
  * other shape loads fine and throws at the first display.
- *
- * `root` is looked up through `self.document` rather than a bare `document` reference: this
- * source module never touches a DOM global itself (it only builds a string), but the string it
- * builds is JavaScript that *will* run in a browser, where it does need to resolve the page's own
- * `document`.
  */
 function renderDefineCall(cell: CellDefinition): string {
-  const state = `{root: self.document.getElementById("cell-${cell.id}"), variables: [], expanded: []}`;
+  const state = `{root: document.getElementById("cell-${cell.id}"), variables: [], expanded: []}`;
   const definition =
     `{"id":${cell.id},"body":${cell.body},` +
     `"inputs":${JSON.stringify(cell.inputs)},"outputs":${JSON.stringify(cell.outputs)},` +

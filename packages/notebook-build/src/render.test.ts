@@ -48,7 +48,11 @@ describe("renderPage", () => {
 
   it("escapes a cell body that contains a closing script tag", () => {
     const html = render('# T\n\n```js\nconst s = "</script>";\n```\n');
-    // The literal must not be able to terminate the module script early.
+    // The literal must not be able to terminate the module script early...
     expect(html).not.toContain('</script>";');
+    // ...but the value must survive, escaped, not simply be dropped. A mutation that deletes
+    // the sequence instead of escaping it would still satisfy the assertion above while
+    // corrupting the notebook's actual behaviour, so it must fail this one.
+    expect(html).toContain('<\\/script>";'); // the escaped form survives, value intact
   });
 });
