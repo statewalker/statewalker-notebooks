@@ -1,4 +1,13 @@
 {
+  // `notebook-events` keeps `lib` at `WebWorker` (no `DOM`) deliberately, so that a bare
+  // `document`/`window`/`localStorage` read fails to typecheck instead of silently working
+  // under vitest's default environment and dying under Node, or vice versa. This package
+  // can't do the same: its shipped `DomEnv` type (serialize.ts) is *itself* `{ document:
+  // Document; parser: DOMParser }`, and `Document`/`DOMParser` are not declared by
+  // `lib.webworker.d.ts` — only by `lib.dom.d.ts`. So `DOM` is here for the *types*, not for
+  // ambient access to the globals; the property it would otherwise lose is restored by
+  // `src/no-dom-globals.test.ts`, which fails if any non-test source file reads one of those
+  // names as a bare global rather than through the injected `DomEnv`.
   "compilerOptions": {
     "target": "ES2022",
     "module": "Preserve",

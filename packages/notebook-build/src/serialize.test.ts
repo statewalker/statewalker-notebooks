@@ -33,6 +33,15 @@ describe("serializeNotebook", () => {
     const nb = parseMarkdown("# T\n\n```js\n1\n```\n");
     expect(serializeNotebook(nb, dom)).toBe(serializeNotebook(nb, dom));
   });
+
+  it("is byte-stable for the same notebook, across time", async () => {
+    const dom = nodeDom();
+    const nb = parseMarkdown("# T\n\n```js\n1\n```\n");
+    const first = serializeNotebook(nb, dom);
+    await new Promise((r) => setTimeout(r, 25)); // outlast a ms-resolution clock
+    const second = serializeNotebook(nb, dom);
+    expect(second).toBe(first);
+  });
 });
 
 describe("notebookHash", () => {
