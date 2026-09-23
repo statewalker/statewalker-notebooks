@@ -24,6 +24,38 @@ const fakeServer = () => ({
     }),
 });
 
+/**
+ * A scoped package — `@duckdb/duckdb-wasm` is the exact motivating case named in
+ * `deps.ts`'s own docstring. Its resolved URL puts a scope segment (`@duckdb/`) before
+ * the `{name}@{version}` segment, so "take the first slash after basePath" lands on the
+ * scope boundary, not the version boundary.
+ */
+const fakeScopedServer = () => ({
+  resolve: async () => ({
+    url: "/_m/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-browser.mjs",
+    target: "browser" as const,
+  }),
+  listResources: async () => [
+    "/_m/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-browser.mjs",
+    "/_m/@duckdb/duckdb-wasm@1.29.0/dist/helper.js",
+  ],
+  listPackageFiles: async () => [
+    "dist/duckdb-browser.mjs",
+    "dist/helper.js",
+    "dist/duckdb-eh.wasm",
+    "README.md",
+  ],
+  fetch: async (req: Request) =>
+    new Response(new Uint8Array([1, 2, 3]), {
+      status: 200,
+      headers: {
+        "content-type": new URL(req.url).pathname.endsWith(".wasm")
+          ? "application/wasm"
+          : "text/javascript",
+      },
+    }),
+});
+
 describe("materializeDeps", () => {
   it("writes every JS-reachable module", async () => {
     const output = new MemFilesApi();
@@ -80,5 +112,39 @@ describe("materializeDeps", () => {
       "/_m/",
     );
     expect(written).toEqual([]);
+  });
+
+  // The defect this guards against: computing the package root as "first slash after
+  // basePath" lands on the scope separator for a scoped package, not the version
+  // boundary, and requests a bogus URL that 404s against a real server.
+  it("computes the correct package root for a scoped package", async () => {
+    const output = new MemFilesApi();
+    const written = await materializeDeps(
+      new Map([
+        ["npm:@duckdb/duckdb-wasm", "/_m/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-browser.mjs"],
+      ]),
+      fakeScopedServer() as never,
+      output,
+      "/_m/",
+    );
+    expect(await output.exists("/_m/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-eh.wasm")).toBe(true);
+    expect(written).toContain("/_m/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-eh.wasm");
+    expect(written).not.toContain("/_m/@duckdb/dist/duckdb-eh.wasm");
+  });
+
+  it("throws naming the offending URL when the package root cannot be parsed", async () => {
+    const output = new MemFilesApi();
+    const badServer = {
+      ...fakeServer(),
+      resolve: async () => ({ url: "/_m/not-a-package-root", target: "browser" as const }),
+    };
+    await expect(
+      materializeDeps(
+        new Map([["npm:duck", "/_m/not-a-package-root"]]),
+        badServer as never,
+        output,
+        "/_m/",
+      ),
+    ).rejects.toThrow(/not-a-package-root/);
   });
 });

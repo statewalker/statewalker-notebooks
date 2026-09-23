@@ -24,11 +24,38 @@ export interface ModuleServerLike {
   fetch(request: Request): Promise<Response>;
 }
 
-/** `/_m/duck@1/dist/duckdb-browser.mjs` + `/_m/` -> `/_m/duck@1/`, or undefined if malformed. */
-function packageRoot(url: string, basePath: string): string | undefined {
-  const idx = url.indexOf("/", basePath.length + 1);
-  if (idx === -1) return undefined;
-  return url.slice(0, idx + 1);
+/**
+ * Matches one `(@scope/)?name@version` segment. The scope, when present, contains a
+ * `/` itself (`@duckdb/duckdb-wasm@1.29.0`) — so the package root is NOT "the first
+ * slash after basePath": for a scoped package that first slash is the scope
+ * separator, one segment short of the version boundary. This is the same grammar
+ * `webrun-modules`'s own `depsRoot` uses for the identical problem (deriving a
+ * package's module root from a `{name}@{version}/...` id).
+ */
+const PACKAGE_ROOT_RE = /^((?:@[^/]+\/)?[^/]+@[^/]+)\//;
+
+/**
+ * `/_m/duck@1/dist/duckdb-browser.mjs` + `/_m/` -> `/_m/duck@1/`.
+ * `/_m/@duckdb/duckdb-wasm@1.29.0/dist/x.mjs` + `/_m/` -> `/_m/@duckdb/duckdb-wasm@1.29.0/`.
+ *
+ * Throws rather than silently skipping a URL it cannot parse: a silent skip here
+ * drops the whole side-car-asset union for that pin with no signal, which is the
+ * wrong failure mode for a parsing gap that was already proven too naive once.
+ */
+function packageRoot(url: string, basePath: string): string {
+  if (!url.startsWith(basePath)) {
+    throw new Error(
+      `cannot determine the package root of "${url}": not under basePath "${basePath}"`,
+    );
+  }
+  const rest = url.slice(basePath.length);
+  const match = PACKAGE_ROOT_RE.exec(rest);
+  if (!match) {
+    throw new Error(
+      `cannot determine the package root of "${url}": expected "(@scope/)?name@version/..." after basePath "${basePath}"`,
+    );
+  }
+  return `${basePath}${match[1]}/`;
 }
 
 /**
@@ -58,10 +85,8 @@ export async function materializeDeps(
 
     // The union that makes the export actually work.
     const pkgRoot = packageRoot(url, basePath);
-    if (pkgRoot !== undefined) {
-      for (const file of await server.listPackageFiles(ref)) {
-        if (ASSET_EXTENSIONS.some((ext) => file.endsWith(ext))) urls.add(pkgRoot + file);
-      }
+    for (const file of await server.listPackageFiles(ref)) {
+      if (ASSET_EXTENSIONS.some((ext) => file.endsWith(ext))) urls.add(pkgRoot + file);
     }
   }
 
