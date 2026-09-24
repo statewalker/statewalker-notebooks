@@ -1,0 +1,49 @@
+{
+  "name": "@statewalker/notebook-db",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Back notebook-kit SQL cells with any @statewalker/db-api database.",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "prepack": "pnpm run build",
+    "test": "pnpm run build && vitest run --passWithNoTests",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@observablehq/notebook-kit": "^2.6.4"
+  },
+  "peerDependencies": {
+    "@statewalker/db-api": "workspace:*"
+  },
+  "peerDependenciesMeta": {
+    "@statewalker/db-duckdb-browser": {
+      "optional": true
+    },
+    "@statewalker/db-duckdb-node": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@statewalker/db-api": "workspace:*",
+    "tsdown": "^0.23.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.1"
+  },
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  }
+}

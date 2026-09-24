@@ -10,16 +10,16 @@
  *   node serve.mjs            build once and serve
  *   node serve.mjs --watch    also rebuild when a notebook changes
  */
-import { createServer } from "node:http";
-import { watch } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
 
-import { JSDOM } from "jsdom";
-import { NodeFilesApi } from "@statewalker/webrun-files-node";
-import { newModuleServer } from "@statewalker/webrun-modules";
+import { watch } from "node:fs";
+import { createServer } from "node:http";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { newNotebookBuild } from "@statewalker/notebook-build";
 import { newNotebookSite } from "@statewalker/notebook-site";
+import { NodeFilesApi } from "@statewalker/webrun-files-node";
+import { newModuleServer } from "@statewalker/webrun-modules";
+import { JSDOM } from "jsdom";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 8099);
@@ -50,7 +50,9 @@ const build = newNotebookBuild({
   onFailed: ({ notebookPath, error }) =>
     console.error(`  ✗ ${notebookPath}: ${error?.message ?? error}`),
   onRebuilt: (changed) =>
-    console.log(`  ✓ ${changed.length} file(s) written: ${changed.slice(0, 4).join(", ")}${changed.length > 4 ? " …" : ""}`),
+    console.log(
+      `  ✓ ${changed.length} file(s) written: ${changed.slice(0, 4).join(", ")}${changed.length > 4 ? " …" : ""}`,
+    ),
 });
 
 const handler = newNotebookSite({ output, moduleServer, basePath: "/_m/" });
