@@ -229,4 +229,129 @@ describe("materializeDeps", () => {
       ),
     ).rejects.toThrow(/not-a-package-root/);
   });
+
+  // --- D4: DuckDB's workers -----------------------------------------------------------------
+  //
+  // Two independent failures, and a test that checked only PRESENCE would pass on the second.
+  //
+  //  1. `*.worker.js` is not JS-reachable (nothing `import`s it; `new Worker(url)` loads it by
+  //     URL), so `listResources` never reports it, and it matched no `ASSET_EXTENSIONS` entry
+  //     either — so a static export shipped NONE of duckdb-wasm's 7 worker files. The page then
+  //     404s on the worker, `new Worker()` reports that through `onerror` (which
+  //     `browser-duckdb.ts` does not listen for), and `db.instantiate()` hangs forever with no
+  //     error anywhere.
+  //  2. The module server's default transform wraps a file it detects as CJS (duckdb-wasm's
+  //     worker bundles are UMD) into an ESM interop shim containing `import`/`export`. A
+  //     CLASSIC worker cannot parse that — same silent hang. `?raw` bypasses the transform.
+  //
+  // The fake below therefore serves DIFFERENT bytes for `?raw`, which is what makes layer 2
+  // falsifiable: an implementation that ships the file but fetches it transformed goes red.
+  const ESM_WRAPPED = 'import { Buffer, __dirname } from "../~deps/~globals.js";var __m;';
+  const RAW_UMD = '"use strict";var duckdb=(()=>{var qc=Object.create;';
+
+  const fakeWorkerServer = () => ({
+    resolve: async () => ({
+      url: "/_m/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-browser.mjs",
+      target: "browser" as const,
+    }),
+    // JS-reachable graph only: the workers are absent, exactly as the real server reports them.
+    listResources: async () => ["/_m/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-browser.mjs"],
+    listPackageFiles: async () => [
+      "dist/duckdb-browser.mjs",
+      "dist/duckdb-eh.wasm",
+      "dist/duckdb-browser-eh.worker.js",
+      "dist/duckdb-browser-mvp.worker.js",
+      // Must NOT ship: a source map is dead weight in an export and a blanket
+      // `*.worker.js*` glob would drag it along.
+      "dist/duckdb-browser-eh.worker.js.map",
+      "README.md",
+    ],
+    fetch: async (req: Request) => {
+      const url = new URL(req.url);
+      const raw = url.searchParams.has("raw");
+      const body = url.pathname.endsWith(".worker.js")
+        ? raw
+          ? RAW_UMD
+          : ESM_WRAPPED
+        : "// module";
+      return new Response(body, {
+        status: 200,
+        headers: { "content-type": raw ? "application/octet-stream" : "text/javascript" },
+      });
+    },
+  });
+
+  async function readAll(files: MemFilesApi, path: string): Promise<string> {
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of files.read(path)) chunks.push(chunk);
+    return new TextDecoder().decode(
+      chunks.reduce((acc, c) => {
+        const out = new Uint8Array(acc.length + c.length);
+        out.set(acc);
+        out.set(c, acc.length);
+        return out;
+      }, new Uint8Array()),
+    );
+  }
+
+  it("ships a package's worker scripts, untransformed, and not their source maps", async () => {
+    const output = new MemFilesApi();
+    const written = await materializeDeps(
+      new Map([
+        ["npm:@duckdb/duckdb-wasm", "/_m/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-browser.mjs"],
+      ]),
+      fakeWorkerServer() as never,
+      output,
+      "/_m/",
+    );
+
+    const worker = "/_m/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-browser-eh.worker.js";
+    // Layer 1: it is in the export at all.
+    expect(written).toContain(worker);
+    expect(written).toContain("/_m/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-browser-mvp.worker.js");
+    expect(await output.exists(worker)).toBe(true);
+
+    // Layer 2: and it is the untransformed body. A classic `new Worker(url)` cannot parse an
+    // ESM shim, and the failure is a silent hang, so presence alone proves nothing.
+    const body = await readAll(output, worker);
+    expect(body).toBe(RAW_UMD);
+    expect(body).not.toContain("import");
+    expect(body).not.toContain("~deps/~globals.js");
+
+    // The output PATH keeps its `.js` extension — the query string belongs to the fetch, not
+    // to the file — which is what makes a static host answer with a JavaScript MIME type.
+    expect(written.filter((u) => u.includes("?"))).toEqual([]);
+
+    // The map is dead weight; a blanket glob would have taken it.
+    expect(written).not.toContain(`${worker}.map`);
+    expect(await output.exists(`${worker}.map`)).toBe(false);
+  });
+
+  it("still fetches non-worker files through the transform", async () => {
+    const output = new MemFilesApi();
+    const seen: string[] = [];
+    const server = fakeWorkerServer();
+    const spy = {
+      ...server,
+      fetch: async (req: Request) => {
+        seen.push(req.url);
+        return server.fetch(req);
+      },
+    };
+    await materializeDeps(
+      new Map([
+        ["npm:@duckdb/duckdb-wasm", "/_m/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-browser.mjs"],
+      ]),
+      spy as never,
+      output,
+      "/_m/",
+    );
+    // `?raw` is a worker-only escape hatch: a module fetched raw would skip the transform that
+    // rewrites its own bare-specifier imports, and the page would fail to resolve them.
+    const mjs = seen.find((u) => u.includes("duckdb-browser.mjs"));
+    expect(mjs).toBeDefined();
+    expect(mjs).not.toContain("raw");
+    expect(seen.find((u) => u.includes("duckdb-eh.wasm"))).not.toContain("raw");
+    expect(seen.filter((u) => u.includes("?raw"))).toHaveLength(2);
+  });
 });

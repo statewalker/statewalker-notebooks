@@ -15,6 +15,39 @@ import { isNpmSpecifier, type ModuleRef, type PinMap, toModuleRef } from "./reso
 export const ASSET_EXTENSIONS = [".wasm", ".woff2", ".woff", ".ttf", ".css"] as const;
 
 /**
+ * Classic worker scripts a package ships. Same blind spot as {@link ASSET_EXTENSIONS} — nothing
+ * `import`s them, they are loaded by URL with `new Worker(url)`, so `listResources` never
+ * reports them — but they cannot be folded into that list, for two reasons.
+ *
+ * First, the match has to be WORKER-specific rather than an extension: `.js` would sweep in
+ * every JS file a package ships whether the page uses it or not, and `*.worker.js*` (a blanket
+ * glob) would drag `*.worker.js.map` along, which is dead weight in an export.
+ *
+ * Second — and this is the half that survives shipping the file — a worker script must be
+ * fetched with `?raw`. The module server's default transform wraps a file it detects as CJS
+ * (duckdb-wasm's worker bundles are UMD) into an ESM interop shim:
+ *
+ *     import { Buffer, __dirname, ... } from "../~deps/~globals.js";var __m;...
+ *
+ * A classic `Worker` cannot parse `import`, and `new Worker()` reports the SyntaxError
+ * asynchronously through `onerror` — which `@statewalker/db-duckdb-browser`'s
+ * `browser-duckdb.ts` does not listen for — so `db.instantiate()` hangs forever with no error
+ * anywhere. `?raw` bypasses the transform and serves the untouched UMD bytes:
+ *
+ *     "use strict";var duckdb=(()=>{var qc=Object.create;...
+ *
+ * The `?raw` belongs to the FETCH only. The file is written at its plain `.worker.js` path, so
+ * a static host derives a JavaScript MIME type from the extension the way it does for any other
+ * script — which is what the spec requires for a classic worker, and which `?raw`'s own
+ * `application/octet-stream` response header would not give (Chromium tolerates it today).
+ *
+ * The cleaner fix is upstream: `webrun-modules` should serve `*.worker.js` untransformed by
+ * default, since its only consumer is `new Worker(url)`. That is a different repo; this is the
+ * consumer-side workaround.
+ */
+const WORKER_SCRIPT = /\.worker\.js$/;
+
+/**
  * Structural subset of `@statewalker/webrun-modules`'s `ModuleServer` used here, so
  * tests need no real server.
  */
@@ -92,7 +125,9 @@ export async function materializeDeps(
   output: FilesApi,
   basePath: string,
 ): Promise<string[]> {
-  const urls = new Set<string>();
+  // url -> fetch it with `?raw`. A Map rather than a Set because the same output path can be
+  // reached twice and the two reachings disagree about the representation; see WORKER_SCRIPT.
+  const urls = new Map<string, boolean>();
 
   for (const [specifier, url] of pins) {
     if (!isNpmSpecifier(specifier)) continue;
@@ -102,21 +137,28 @@ export async function materializeDeps(
       if (!u.startsWith(basePath)) {
         throw new Error(`cannot materialize ${u}: not under basePath "${basePath}"`);
       }
-      urls.add(containedUrl(basePath, u.slice(basePath.length), "module"));
+      urls.set(containedUrl(basePath, u.slice(basePath.length), "module"), false);
     }
 
     // The union that makes the export actually work.
     const pkgRoot = packageRoot(url, basePath);
     for (const file of await server.listPackageFiles(ref)) {
       if (ASSET_EXTENSIONS.some((ext) => file.endsWith(ext))) {
-        urls.add(containedUrl(pkgRoot, file, "package file"));
+        urls.set(containedUrl(pkgRoot, file, "package file"), false);
+      } else if (WORKER_SCRIPT.test(file)) {
+        // Set AFTER the module pass and unconditionally: if a worker script somehow also shows
+        // up as a JS-reachable resource, the raw representation still wins — how the file is
+        // LOADED (`new Worker`, a classic script) decides what it may contain, and a transformed
+        // body is unusable there whatever else points at it.
+        urls.set(containedUrl(pkgRoot, file, "worker script"), true);
       }
     }
   }
 
   const written: string[] = [];
-  for (const url of urls) {
-    const res = await server.fetch(new Request(`http://local${url}`));
+  for (const [url, raw] of urls) {
+    // `?raw` on the REQUEST only; `url` stays the output path, extension intact.
+    const res = await server.fetch(new Request(`http://local${url}${raw ? "?raw" : ""}`));
     if (!res.ok) throw new Error(`cannot materialize ${url}: ${res.status}`);
     const data = new Uint8Array(await res.arrayBuffer());
     await output.write(url, [data]);

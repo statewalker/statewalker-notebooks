@@ -323,4 +323,28 @@ describe("newNotebookSite — static export mode", () => {
     const handler = newNotebookSite({ output });
     expect((await handler(new Request("http://h/_m/absent@1/index.js"))).status).toBe(404);
   });
+
+  // A DuckDB worker is materialized into the export by `notebook-build`'s `materializeDeps`,
+  // which fetches it with `?raw` to dodge the module server's ESM transform. `?raw` answers
+  // with `content-type: application/octet-stream`, and the spec requires a JavaScript MIME
+  // type for a CLASSIC worker script — so what matters is the type THIS site derives from the
+  // stored file, not the one the fetch during materialization happened to carry. Pins that:
+  // a `.worker.js` is served as JavaScript like any other script.
+  it("serves a materialized classic worker script with a JavaScript content-type", async () => {
+    const output = new MemFilesApi();
+    await writeText(output, "/index.html", "<!doctype html>");
+    await writeText(
+      output,
+      "/_m/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-browser-eh.worker.js",
+      '"use strict";var duckdb=(()=>{})();',
+    );
+
+    const handler = newNotebookSite({ output });
+    const res = await handler(
+      new Request("http://h/_m/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-browser-eh.worker.js"),
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("javascript");
+    expect(res.headers.get("content-type")).not.toContain("octet-stream");
+  });
 });
