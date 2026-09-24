@@ -142,6 +142,8 @@ interface Host {
   logger: Logger;
   /** Hash of the configuration above — see `NotebookState.configHash`. */
   configHash: string;
+  /** Memoized: the three roots are probed once per `NotebookBuild`, not once per build. */
+  rootsChecked?: Promise<void>;
   /** Output paths written during the current `build()`. */
   changed: Set<string>;
   failures: NotebookFailure[];
@@ -169,6 +171,48 @@ function configHashOf(options: NotebookBuildOptions): Promise<string> {
       stylesUrl: options.stylesUrl ?? null,
     }),
   );
+}
+
+/**
+ * Proves the three roots are three places, by writing a file into one and looking for it in
+ * the others.
+ *
+ * The constructor compares instance identity, which is all a constructor can do — and three
+ * `new NodeFilesApi({rootDir: base})` over one directory pass it while being the same tree.
+ * The consequences are not subtle: the engine's scanner finds the sidecars it just wrote and
+ * feeds generated files back in as sources, and the static site publishes the build's own
+ * cache. The probe is hidden (a leading dot, so the scanner skips it) and removed again.
+ *
+ * It compares the ROOTS. Two instances that overlap only deeper down — an output rooted inside
+ * the notebooks tree — are not caught here, and nothing short of resolving real paths would.
+ */
+async function assertDistinctRoots(host: Host): Promise<void> {
+  const probe = joinPath("/", `${SYSTEM_FOLDER}.probe`);
+  const pairs: [string, FilesApi, [string, FilesApi][]][] = [
+    [
+      "cache",
+      host.cache,
+      [
+        ["notebooks", host.notebooks],
+        ["output", host.output],
+      ],
+    ],
+    ["output", host.output, [["notebooks", host.notebooks]]],
+  ];
+  for (const [name, files, others] of pairs) {
+    await writeText(files, probe, name);
+    try {
+      for (const [otherName, other] of others) {
+        if (!(await other.exists(probe))) continue;
+        throw new Error(
+          `newNotebookBuild: \`${name}\` and \`${otherName}\` are the same directory — ` +
+            "they must be distinct FilesApi instances over distinct roots",
+        );
+      }
+    } finally {
+      if (await files.exists(probe)) await files.remove(probe);
+    }
+  }
 }
 
 /** A `ModuleResolver` that resolves each specifier at most once per build. */
@@ -651,6 +695,8 @@ export function newNotebookBuild(options: NotebookBuildOptions): NotebookBuild {
       host.runtime = undefined;
       host.resolver.reset();
       host.configHash = await configHashOf(options);
+      host.rootsChecked ??= assertDistinctRoots(host);
+      await host.rootsChecked;
       // Before the engine's mtime scanner gets a say: everything else the pages depend on.
       await revalidate(host);
       for await (const _ of engine.run()) {

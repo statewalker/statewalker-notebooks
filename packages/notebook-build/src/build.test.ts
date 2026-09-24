@@ -1,5 +1,9 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type FilesApi, readText, writeText } from "@statewalker/webrun-files";
 import { MemFilesApi } from "@statewalker/webrun-files-mem";
+import { NodeFilesApi } from "@statewalker/webrun-files-node";
 import { JSDOM } from "jsdom";
 import { describe, expect, it } from "vitest";
 import { type NotebookFailure, newNotebookBuild } from "./build.js";
@@ -122,6 +126,40 @@ describe("newNotebookBuild", () => {
         dom: nodeDom(),
       }),
     ).toThrow(/distinct/);
+  });
+
+  // The constructor's guard compares instance identity, which three `new NodeFilesApi(...)`
+  // over one directory pass while being the same tree: the engine's scanner then finds the
+  // sidecars it just wrote, and the static site publishes them.
+  it("refuses three distinct instances that are the same directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nb-roots-"));
+    try {
+      const b = newNotebookBuild({
+        notebooks: new NodeFilesApi({ rootDir: root }),
+        output: new NodeFilesApi({ rootDir: root }),
+        cache: new NodeFilesApi({ rootDir: root }),
+        moduleServer: fakeServer().server,
+        dom: nodeDom(),
+      });
+      await expect(b.build()).rejects.toThrow(/same directory|distinct/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts three instances that really are three directories", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nb-roots-"));
+    try {
+      await newNotebookBuild({
+        notebooks: new NodeFilesApi({ rootDir: join(root, "notebooks") }),
+        output: new NodeFilesApi({ rootDir: join(root, "out") }),
+        cache: new NodeFilesApi({ rootDir: join(root, "cache") }),
+        moduleServer: fakeServer().server,
+        dom: nodeDom(),
+      }).build();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("puts the stylesheet on the page when one is configured", async () => {
