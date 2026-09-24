@@ -94,6 +94,40 @@ describe("newNotebookBuild", () => {
     expect(await readText(output, "/b.html")).toContain('"outputs":["y"]');
   });
 
+  /**
+   * The end-to-end shape of the two defects a widened `CODE_MODES` exposed. A `sql` cell's
+   * `${…}` interpolations are compiled as JavaScript by notebook-kit, so both the
+   * `FileAttachment` and the dynamic import inside one are real requests the page will make.
+   * While `assets.ts` and `resolve.ts` each kept their own narrow copy of the mode set, the
+   * build emitted both into the page and published neither: the attachment 404'd, and the
+   * specifier reached the browser unresolved as `TypeError: Failed to resolve module
+   * specifier`. `read_csv(FileAttachment(...).url())` is the idiomatic DuckDB pattern.
+   */
+  it("publishes a sql cell's attachment and pins its import", async () => {
+    const notebooks = new MemFilesApi();
+    await writeText(notebooks, "/sales.csv", "a,b\n1,2\n");
+    await writeText(
+      notebooks,
+      "/q.md",
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: `${…}` is notebook-kit SQL-cell interpolation syntax inside notebook SOURCE, not a JS template.
+      '# Q\n\n```sql\nSELECT ${(await import("npm:d3-array")).max([1, 2])} FROM read_csv(${await FileAttachment("sales.csv").url()})\n```\n',
+    );
+    const output = new MemFilesApi();
+    const failures: NotebookFailure[] = [];
+    const { server, calls } = fakeServer();
+    await build(notebooks, output, {
+      moduleServer: server,
+      onFailed: (f) => failures.push(...f),
+    }).build();
+
+    expect(failures).toEqual([]);
+    expect(await output.exists("/sales.csv")).toBe(true);
+    expect(calls).toContain("resolve d3-array");
+    const page = await readText(output, "/q.html");
+    expect(page).toContain("/_m/d3-array@1/index.js");
+    expect(page).not.toContain('import(\\"npm:d3-array\\")');
+  });
+
   it("notifies with the changed paths on convergence", async () => {
     const notebooks = await seed();
     const changed: string[][] = [];

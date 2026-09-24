@@ -22,6 +22,23 @@ describe("collectSpecifiers", () => {
     expect(collectSpecifiers(nb)).toEqual(["d3"]);
   });
 
+  /**
+   * notebook-kit compiles a `sql` cell's `${…}` interpolations as JavaScript — `transpile.js`
+   * routes every non-js/ts/ojs mode through `transpileJavaScript(transpileTemplate(cell),
+   * options)`, so the interpolations reach `rewriteImportExpressions` with
+   * `options.resolveImport`. Verified by running the installed notebook-kit 2.6.4 directly:
+   * `transpile('SELECT ${(await import("npm:d3-array")).max([1,2])}', "sql", {resolveImport})`
+   * offers `npm:d3-array` to the resolver and emits the returned URL into the body. Skipping
+   * `sql` here left such a specifier unresolved and unpinned in the emitted page.
+   */
+  it("finds an import specifier inside a sql cell's interpolation", () => {
+    const nb = parseMarkdown(
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: `${…}` is notebook-kit SQL-cell interpolation syntax inside notebook SOURCE, not a JS template.
+      '# T\n\n```sql\nSELECT ${(await import("npm:d3-array")).max([1, 2])}\n```\n',
+    );
+    expect(collectSpecifiers(nb)).toEqual(["npm:d3-array"]);
+  });
+
   it("ignores cells that are not code", () => {
     expect(collectSpecifiers(parseMarkdown("# T\n\njust prose\n"))).toEqual([]);
   });
@@ -55,6 +72,19 @@ describe("resolveNotebook", () => {
       if (!url) throw new Error(`no such package: ${ref.pkg}`);
       return { url, target: "browser" as const };
     },
+  });
+
+  it("pins a module imported from a sql cell's interpolation", async () => {
+    const nb = parseMarkdown(
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: `${…}` is notebook-kit SQL-cell interpolation syntax inside notebook SOURCE, not a JS template.
+      '# T\n\n```sql\nSELECT ${(await import("npm:d3-array")).max([1, 2])}\n```\n',
+    );
+    const pins = await resolveNotebook(
+      nb,
+      { moduleServer: fakeServer({ "d3-array": "/_m/d3-array@3.2.4/index.js" }) },
+      "/n/a.md",
+    );
+    expect(pins.get("npm:d3-array")).toBe("/_m/d3-array@3.2.4/index.js");
   });
 
   it("maps every specifier to its resolved URL", async () => {

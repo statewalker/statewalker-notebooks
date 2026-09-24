@@ -1,4 +1,5 @@
 import { type Notebook, transpile } from "@observablehq/notebook-kit";
+import { CODE_MODES } from "./transpile.js";
 
 export type PinMap = ReadonlyMap<string, string>;
 
@@ -26,19 +27,23 @@ export class ResolveError extends Error {
 }
 
 /**
- * Deliberately NARROWER than the transpile stage's `CODE_MODES`, which also compiles `sql`.
- * This set answers "which cells can contain an import specifier", and a `sql` cell cannot: its
- * value is SQL text that notebook-kit turns into a tagged template, so it has no import
- * declaration and no `import()` for the walker below to find. Any future mode admitted here
- * must be one whose source is JavaScript.
- */
-const CODE_MODES = new Set(["js", "ts", "ojs"]);
-
-/**
  * Every import specifier in the notebook, deduplicated, in first-seen order.
  * Collected by transpiling with a recording resolver — notebook-kit already
  * knows how to find every static, namespace and dynamic import, so we reuse
  * its walker instead of writing a second one that can drift from it.
+ *
+ * Gated on the transpile stage's `CODE_MODES`, imported rather than copied. A `sql` cell does
+ * belong in it: notebook-kit's `transpile.js` routes every non-js/ts/ojs mode through
+ * `transpileJavaScript(transpileTemplate(cell), options)`, so the cell's `${…}` interpolations
+ * are compiled as JavaScript and DO reach `rewriteImportExpressions` with `resolveImport`.
+ * Confirmed by running the installed notebook-kit 2.6.4: transpiling
+ * `SELECT ${(await import("npm:d3-array")).max([1,2])}` as `sql` offers `npm:d3-array` to the
+ * resolver and emits the URL it returns. A copy of this set that left `sql` out was measured
+ * doing real damage: in a full build `moduleServer.resolve` was never called for the
+ * specifier, and the page went out carrying
+ * ``(await DatabaseClient.of(db, "db")).sql`SELECT ${(await import("npm:d3-array"))…` `` —
+ * a bare `npm:` specifier no browser can resolve, and in static mode a module the export's
+ * dependency closure does not contain either.
  */
 export function collectSpecifiers(nb: Notebook): string[] {
   const seen = new Set<string>();

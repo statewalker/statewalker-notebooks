@@ -40,6 +40,28 @@ describe("copyAttachments", () => {
     ).rejects.toThrow(/gone\.csv/);
   });
 
+  /**
+   * A `sql` cell's `${…}` interpolations are compiled as JavaScript by notebook-kit
+   * (`transpile.js` routes every non-js/ts/ojs mode through `transpileJavaScript(
+   * transpileTemplate(cell))`), so a `FileAttachment` there is a real fetch the page will
+   * make. Verified against the installed notebook-kit 2.6.4: `transpile(cell, "sql",
+   * {resolveFiles: true}).files` is `Set(1) { 'data.csv' }`. Before this cell's mode was
+   * admitted here the page fetched a file the build never published — a 404 in both hosted
+   * and static mode.
+   */
+  it("copies a FileAttachment referenced from a sql cell's interpolation", async () => {
+    const source = new MemFilesApi();
+    const output = new MemFilesApi();
+    await writeText(source, "/nb/sales.csv", "a,b\n1,2\n");
+    const nb = parseMarkdown(
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: `${…}` is notebook-kit SQL-cell interpolation syntax inside notebook SOURCE, not a JS template.
+      '# T\n\n```sql\nSELECT * FROM read_csv(${await FileAttachment("sales.csv").url()})\n```\n',
+    );
+    const written = await copyAttachments(nb, source, output, "/nb/index.md");
+    expect(written.map((a) => a.path)).toEqual(["/nb/sales.csv"]);
+    expect(await output.exists("/nb/sales.csv")).toBe(true);
+  });
+
   it("copies each attachment once when several cells reference it", async () => {
     const source = new MemFilesApi();
     const output = new MemFilesApi();

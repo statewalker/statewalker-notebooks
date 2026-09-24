@@ -2,6 +2,7 @@ import { type Notebook, transpile } from "@observablehq/notebook-kit";
 import { dirname, type FilesApi, readFile } from "@statewalker/webrun-files";
 import { contentHash } from "./hash.js";
 import { resolveWithin } from "./paths.js";
+import { CODE_MODES } from "./transpile.js";
 
 /** One copied attachment: where it landed, and the hash of the bytes that were copied. */
 export interface CopiedAttachment {
@@ -10,14 +11,20 @@ export interface CopiedAttachment {
   hash: string;
 }
 
-const CODE_MODES = new Set(["js", "ts", "ojs"]);
-
 /**
  * Every `FileAttachment` name referenced in the notebook, deduplicated, in first-seen
  * order. Collected the same way `[Resolve]` collects import specifiers: by transpiling
  * with notebook-kit's own file-resolution walker and reading the `files` set it already
  * returns, instead of a second hand-rolled scan of the source that could drift from what
  * notebook-kit itself parses.
+ *
+ * Gated on the SAME `CODE_MODES` the transpile stage compiles with — a THIRD copy of that set
+ * is what let a `sql` cell's `FileAttachment` be emitted into the page and never copied. The
+ * two sets cannot be allowed to differ in either direction: a mode this build emits code for
+ * is a mode whose attachments the page will fetch. A `sql` cell's `${…}` interpolations are
+ * compiled as JavaScript (notebook-kit's `transpile.js` routes every non-js/ts/ojs mode
+ * through `transpileJavaScript(transpileTemplate(cell), options)`), so `transpile(…,
+ * {resolveFiles: true}).files` reports their attachments like any other cell's.
  */
 function collectAttachmentNames(nb: Notebook): string[] {
   const seen = new Set<string>();
