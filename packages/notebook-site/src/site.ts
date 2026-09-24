@@ -1,6 +1,7 @@
 import type { PubSub } from "@statewalker/notebook-events";
 import type { FilesApi } from "@statewalker/webrun-files";
 import { SiteBuilder, type SiteHandler } from "@statewalker/webrun-site-builder";
+import { withDecodedPaths } from "./decode-path.js";
 
 export interface NotebookSiteOptions {
   /** The built site: notebook pages, attachments, and in static mode the deps. */
@@ -44,7 +45,10 @@ export function newNotebookSite({
     builder.setEndpoint(`${eventsPath}/*`, (request) => events.handler(request));
   }
 
-  builder.setFiles("/", output, { directoryIndex });
+  // `withDecodedPaths`, not `output` directly: a URL pathname is percent-encoded, and nothing
+  // below this line decodes it. See `decode-path.ts` — without it `/My%20Notebook.html` 404s
+  // here while the same file, served as a static export, does not.
+  builder.setFiles("/", withDecodedPaths(output), { directoryIndex });
 
   // A thrown handler in a ServiceWorker takes down every open page, so
   // nothing is allowed to escape as a rejection.

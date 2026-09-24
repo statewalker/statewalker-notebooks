@@ -10,6 +10,13 @@ async function seededOutput() {
   await writeText(output, "/index.html", "<!doctype html><title>Home</title>");
   await writeText(output, "/chart.html", "<!doctype html><title>Chart</title>");
   await writeText(output, "/data.csv", "a,b\n1,2\n");
+  // Deliberately NOT encoding-transparent. `notebook-build`'s `pagePath` keeps the source
+  // filename verbatim and `copyAttachments` keeps an attachment's declared name verbatim, so
+  // both of these are ordinary output of an ordinary build. Keep them: a suite whose every
+  // fixture name survives percent-encoding unchanged cannot see the decoding layer at all.
+  await writeText(output, "/My Notebook.html", "<!doctype html><title>Spaced</title>");
+  await writeText(output, "/Notes/Été.html", "<!doctype html><title>Accented</title>");
+  await writeText(output, "/100% done.csv", "pct\n100\n");
   return output;
 }
 
@@ -54,6 +61,67 @@ describe("newNotebookSite", () => {
     const res = await handler(new Request("http://h/nope.html"));
     expect(res.status).toBe(404);
     expect(statsCalls).toBeGreaterThan(0);
+  });
+
+  // A `SiteHandler` is handed a `Request`, and a URL pathname is percent-encoded by
+  // definition — `new URL("http://h/My Notebook.html").pathname` is already
+  // "/My%20Notebook.html". Nothing below this composition decodes it: `SiteBuilder` passes
+  // `url.pathname` straight through to `newServeFiles`, which passes it straight to
+  // `filesApi.stats`. So without a decoding layer here, every page or attachment whose name
+  // carries a space or a non-ASCII character 404s — while the SAME build, served as a static
+  // export by any ordinary HTTP server, works. The two modes must not disagree.
+  it("serves a page whose name contains a space", async () => {
+    const handler = newNotebookSite({ output: await seededOutput() });
+    const res = await handler(new Request("http://h/My%20Notebook.html"));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Spaced");
+  });
+
+  it("serves a page whose name contains a non-ASCII character", async () => {
+    const handler = newNotebookSite({ output: await seededOutput() });
+    const res = await handler(new Request("http://h/Notes/%C3%89t%C3%A9.html"));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Accented");
+  });
+
+  // A literal `%` in a filename is encoded as `%25`, so decoding must handle it...
+  it("serves a file whose name contains a literal percent sign", async () => {
+    const handler = newNotebookSite({ output: await seededOutput() });
+    const res = await handler(new Request("http://h/100%25%20done.csv"));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("100");
+  });
+
+  // ...and a `%` that is NOT a valid escape must not blow the request up either. Browsers
+  // encode, but a hand-typed or hand-written link does not have to.
+  it("does not throw on an undecodable percent escape", async () => {
+    const handler = newNotebookSite({ output: await seededOutput() });
+    const res = await handler(new Request("http://h/broken%zz.html"));
+    expect(res.status).toBe(404);
+  });
+
+  // Decoding must not hand the backend a path it would not otherwise have seen. `%2f` is the
+  // one that matters: the URL parser leaves it alone (it is NOT a path separator), so a naive
+  // whole-path `decodeURIComponent` would turn "/..%2f..%2fetc/passwd" into "/../../etc/passwd"
+  // and re-create, at the files boundary, exactly the traversal the URL layer refused.
+  it("refuses a traversal smuggled through %2f rather than decoding it into one", async () => {
+    const output = await seededOutput();
+    const seenPaths: string[] = [];
+    const spied: FilesApi = new Proxy(output, {
+      get(target, prop, receiver) {
+        if (prop === "stats") {
+          return async (path: string) => {
+            seenPaths.push(path);
+            return Reflect.get(target, prop, receiver).call(target, path);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const handler = newNotebookSite({ output: spied });
+    const res = await handler(new Request("http://h/..%2f..%2fetc/passwd"));
+    expect(res.status).toBe(404);
+    for (const path of seenPaths) expect(path.split("/")).not.toContain("..");
   });
 
   it("does not throw for a malformed path", async () => {

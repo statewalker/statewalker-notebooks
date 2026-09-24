@@ -70,6 +70,22 @@ describe("the site handler under a real ServiceWorker", () => {
     expect(body).toContain("Chart");
   });
 
+  // The browser is what percent-encodes these, so this is the only place the whole chain —
+  // encode in the page, decode in the composition — is exercised end to end.
+  it("serves pages whose names carry a space and a non-ASCII character", async () => {
+    const baseUrl = await page.evaluate(() => (window as any).__baseUrl);
+    const bodies = await page.evaluate(
+      async (u) =>
+        Promise.all([
+          fetch(`${u}My Notebook.html`).then((r) => r.text()),
+          fetch(`${u}Notes/Été.html`).then((r) => r.text()),
+        ]),
+      baseUrl,
+    );
+    expect(bodies[0]).toContain("Spaced");
+    expect(bodies[1]).toContain("Accented");
+  });
+
   it("serves the directory index through the ServiceWorker", async () => {
     const baseUrl = await page.evaluate(() => (window as any).__baseUrl);
     const body = await page.evaluate(async (u) => (await fetch(u)).text(), baseUrl);

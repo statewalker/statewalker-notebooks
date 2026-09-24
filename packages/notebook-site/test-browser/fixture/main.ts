@@ -12,6 +12,15 @@ import { newNotebookSite } from "../../src/site.js";
 const output = new MemFilesApi();
 await writeText(output, "/index.html", "<!doctype html><title>Hosted</title><h1>Hosted</h1>");
 await writeText(output, "/chart.html", "<!doctype html><title>Chart</title><h1>Chart</h1>");
+// Not encoding-transparent on purpose, exactly as in `src/site.test.ts`: the browser encodes
+// these before the request ever reaches the ServiceWorker, so they are what proves the decode
+// survives the real host and not just the Node one.
+await writeText(output, "/My Notebook.html", "<!doctype html><title>Spaced</title><h1>Spaced</h1>");
+await writeText(
+  output,
+  "/Notes/Été.html",
+  "<!doctype html><title>Accented</title><h1>Accented</h1>",
+);
 
 const events = newPubSub();
 const handler = newNotebookSite({ output, events });
