@@ -1,0 +1,10 @@
+node_modules
+dist
+.out
+.cache
+*.tgz
+
+# The build engine keeps its scanner/transaction state inside the SOURCE tree
+# (BuildEngine takes one FilesApi for scanning and for state). Documented as a
+# known limitation; CompositeFilesApi can mount a separate store for it.
+notebooks/.notebook-build/
