@@ -31,11 +31,14 @@ export function newNotebookSite({
 
   // Endpoints are matched before files, so these prefixes must not collide
   // with a notebook path. Both are underscore-prefixed for that reason.
-  // Minimal: mounted unconditionally. Task 3's failing test is what makes
-  // this conditional, which is what static-export mode needs.
-  builder.setEndpoint(`${basePath.replace(/\/$/, "")}/*`, (request) =>
-    (moduleServer as NonNullable<typeof moduleServer>).fetch(request),
-  );
+  // Conditional on purpose: a static export has no module server at all, so
+  // nothing may claim `/_m/*` — the request must fall through to `setFiles`
+  // below and be served from (or 404 against) the materialized dependency.
+  if (moduleServer) {
+    builder.setEndpoint(`${basePath.replace(/\/$/, "")}/*`, (request) =>
+      moduleServer.fetch(request),
+    );
+  }
 
   if (events) {
     builder.setEndpoint(`${eventsPath}/*`, (request) => events.handler(request));
