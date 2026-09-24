@@ -50,6 +50,25 @@ function recordingFiles(inner: FilesApi): { api: FilesApi; writes: string[] } {
   return { api, writes };
 }
 
+/**
+ * A `FilesApi` whose `write` fails for the paths `shouldFail` selects. The point is to fail
+ * the build at one exact stage — the page write — which no module-server stub can reach.
+ */
+function failingFiles(inner: FilesApi, shouldFail: (path: string) => boolean): FilesApi {
+  return {
+    ...inner,
+    read: (path: string, options?: ReadOptions) => inner.read(path, options),
+    write: async (path: string, content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>) => {
+      if (shouldFail(path)) throw new Error(`write refused: ${path}`);
+      await inner.write(path, content);
+    },
+    list: (path: string, options?: ListOptions) => inner.list(path, options),
+    stats: (path: string) => inner.stats(path),
+    exists: (path: string) => inner.exists(path),
+    remove: (path: string) => inner.remove(path),
+  };
+}
+
 async function mtime(files: FilesApi, path: string): Promise<number> {
   const stats: FileStats | undefined = await files.stats(path);
   if (stats?.kind !== "file") throw new Error(`no such file: ${path}`);
@@ -487,5 +506,102 @@ describe("newNotebookBuild — what invalidates a built page", () => {
     // A deploy driven off `changed` uploads the page and none of its dependencies otherwise.
     expect(changed.at(-1)).toContain("/n.html");
     expect(changed.at(-1)).toContain("/_m/d3@1/index.js");
+  });
+});
+
+/**
+ * The state sidecar is the record "this exact serialization WAS rendered", so it must be the
+ * last thing a render writes. Written any earlier, a later stage's failure leaves a record
+ * claiming success and the notebook is never re-derived — the previous version serves for ever.
+ *
+ * Only one stage of four used to be guarded (`resolveNotebook`, which precedes every candidate
+ * insertion point), so moving the write to just after `copyAttachments` or to just after the
+ * page write left all 73 tests green. Each case below edits v1 to v2, fails at one stage,
+ * then repairs the world WITHOUT touching the source and demands v2.
+ */
+describe("newNotebookBuild — the successful-render record is written last", () => {
+  const V1 = '# V1\n\n```js\nFileAttachment("d.csv");\n```\n';
+  const V2 = '# V2\n\n```js\nFileAttachment("d.csv");\n```\n';
+
+  it("does not record a render whose attachments failed to copy", async () => {
+    const notebooks = new MemFilesApi();
+    const output = new MemFilesApi();
+    await writeText(notebooks, "/n.md", V1);
+    await writeText(notebooks, "/d.csv", "a\n");
+    const b = build(notebooks, output);
+    await b.build();
+    expect(await readText(output, "/n.html")).toContain("V1");
+
+    await tick();
+    await writeText(notebooks, "/n.md", V2);
+    await notebooks.remove("/d.csv");
+    await b.build();
+    expect(await readText(output, "/n.html")).toContain("V1");
+
+    await writeText(notebooks, "/d.csv", "a\n");
+    await b.build();
+    expect(await readText(output, "/n.html")).toContain("V2");
+  });
+
+  it("does not record a render whose page failed to write", async () => {
+    const notebooks = new MemFilesApi();
+    const store = new MemFilesApi();
+    let refuse = false;
+    const output = failingFiles(store, (path) => refuse && path === "/n.html");
+    await writeText(notebooks, "/n.md", V1);
+    await writeText(notebooks, "/d.csv", "a\n");
+    const b = build(notebooks, output);
+    await b.build();
+    expect(await readText(store, "/n.html")).toContain("V1");
+
+    // v2 renders and its attachment copies; only the page write fails. A record written
+    // anywhere before this point claims v2 was published while /n.html still holds v1.
+    refuse = true;
+    await tick();
+    await writeText(notebooks, "/n.md", V2);
+    await b.build();
+    expect(await readText(store, "/n.html")).toContain("V1");
+
+    refuse = false;
+    await b.build();
+    expect(await readText(store, "/n.html")).toContain("V2");
+  });
+
+  it("does not record a render whose closure failed to materialize", async () => {
+    const notebooks = new MemFilesApi();
+    const output = new MemFilesApi();
+    await writeText(notebooks, "/n.md", '# V1\n\n```js\nimport * as d3 from "d3";\n```\n');
+    let broken = false;
+    const server: ModuleServerLike = {
+      ...fakeServer(),
+      listResources: async (ref: ModuleRef) => {
+        if (broken) throw new Error("closure unavailable");
+        return [`/_m/${ref.pkg}@1/index.js`];
+      },
+      fetch: async () => new Response("//module\n", { status: 200 }),
+    };
+    const b = build(notebooks, output, { moduleServer: server, mode: "static" });
+    await b.build();
+    expect(await readText(output, "/n.html")).toContain("V1");
+
+    // The page and the manifest are both written before the closure, so this is the case a
+    // record written "after the page" or "after the manifest" cannot survive: everything the
+    // gate looks at is present and only the closure is missing.
+    // v2 pulls in a SECOND package, so "the closure was materialized" is a question about
+    // v2's closure and not one v1 already answered.
+    broken = true;
+    await tick();
+    await writeText(
+      notebooks,
+      "/n.md",
+      '# V2\n\n```js\nimport * as d3 from "d3";\nimport * as p from "plot";\n```\n',
+    );
+    await b.build();
+    expect(await output.exists("/_m/plot@1/index.js")).toBe(false);
+
+    broken = false;
+    await b.build();
+    expect(await readText(output, "/n.html")).toContain("V2");
+    expect(await output.exists("/_m/plot@1/index.js")).toBe(true);
   });
 });

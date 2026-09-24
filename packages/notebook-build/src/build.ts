@@ -336,7 +336,15 @@ async function revalidate(host: Host): Promise<void> {
     if (path.split("/").some((segment) => segment.startsWith("."))) continue;
     if (!NOTEBOOK_EXT.test(path)) continue;
     const uri = path.slice(1);
-    const reason = await staleReason(host, uri);
+    // The serialized artifact, not the source: it is `[Notebook]`'s record of what it decided
+    // to render, and a `[Page]` that threw consumed its update and left the two disagreeing.
+    // Without this the source's own edit is invisible here — the scanner already spent it.
+    const artifact = await tryReadText(host.cache, sidecarPath(uri, ARTIFACT_SUFFIX));
+    const reason = await staleReason(
+      host,
+      uri,
+      artifact === undefined ? undefined : await notebookHash(artifact),
+    );
     if (reason === undefined) continue;
     host.logger.info("notebook must be re-derived", { notebook: path, reason });
     const statePath = sidecarPath(uri, STATE_SUFFIX);
