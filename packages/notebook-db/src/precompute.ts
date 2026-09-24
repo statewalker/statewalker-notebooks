@@ -310,7 +310,17 @@ export async function precomputeQueries(
       // `newDbClient` already did this, and the pass is idempotent — but `databases` is typed
       // as the `NotebookDbClient` INTERFACE, so a caller's own implementation can hand back a
       // raw `bigint` and `JSON.stringify` would throw "Do not know how to serialize a BigInt",
-      // naming neither the cell nor the query. Serialization defends itself.
+      // naming neither the cell nor the query.
+      //
+      // The defence covers OBJECT rows only, and deliberately. `normalizeRows` converts a row
+      // only when `isPlainObject(row)`, so a client returning TUPLE rows (`[[1n, 2n]]`) passes
+      // through untouched and `JSON.stringify` below still throws that bare BigInt message.
+      // Verified by running the real predicate against `[[1n, 2n]]`: the row comes back
+      // identical and the stringify throws. Closing that hole would not help, it would hurt:
+      // `deriveSchema` skips array rows by the same test, so a tuple result serializes with an
+      // EMPTY schema, and notebook-kit's `revive` iterates that schema — the page would render
+      // unrevived tuples instead of failing. A loud throw at build time is the better outcome
+      // until tuple rows are a shape this package actually supports end to end.
       const normalized = normalizeRows(rows);
       // `{rows, schema}`, never a bare array: notebook-kit's `revive` destructures this object
       // and iterates `schema`, so an array throws `TypeError: schema is not iterable` in the

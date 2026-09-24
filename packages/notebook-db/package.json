@@ -23,14 +23,12 @@
     "test:browser": "vitest run test-browser --config vitest.browser.config.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test-browser.json"
   },
-  "dependencies": {
-    "@observablehq/notebook-kit": "^2.6.4"
-  },
   "peerDependencies": {
     "@statewalker/db-api": "workspace:*",
     "@statewalker/webrun-files": "workspace:*"
   },
   "devDependencies": {
+    "@observablehq/notebook-kit": "^2.6.4",
     "@statewalker/db-api": "workspace:*",
     "@statewalker/db-duckdb-browser": "workspace:*",
     "@statewalker/webrun-files": "workspace:*",
