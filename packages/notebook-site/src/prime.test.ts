@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { ModuleRef } from "./prime.js";
 import { primeModules } from "./prime.js";
 
 describe("primeModules", () => {
@@ -25,6 +26,36 @@ describe("primeModules", () => {
     expect(result.failed).toEqual([{ ref: { pkg: "missing" }, error: "404 from registry" }]);
   });
 
+  // A manifest lists a package once per notebook that imports it, so the same ref arriving
+  // several times is the normal case, not a pathological one. Priming it twice is a wasted
+  // round trip against the very cache this function exists to warm.
+  it("primes a repeated ref only once", async () => {
+    const prime = vi.fn(async (ref: ModuleRef) => ({ url: `/_m/${ref.pkg}` }));
+    const result = await primeModules({ prime } as never, [
+      { pkg: "d3", version: "7" },
+      { pkg: "d3", version: "7" },
+      { pkg: "d3", version: "6" },
+      { pkg: "d3", version: "7", subpath: "array" },
+    ]);
+    expect(prime).toHaveBeenCalledTimes(3);
+    expect(result.primed).toHaveLength(3);
+  });
+
+  // `primed: string[]` threw away which ref produced which url, so a caller that primes a
+  // manifest cannot tell what it got — and a failure is reported against a ref while a success
+  // is reported against a url, which are not comparable.
+  it("reports which ref produced which url", async () => {
+    const prime = vi.fn(async (ref: ModuleRef) => ({ url: `/_m/${ref.pkg}@${ref.version}` }));
+    const result = await primeModules({ prime } as never, [
+      { pkg: "d3", version: "7" },
+      { pkg: "katex", version: "0.16" },
+    ]);
+    expect(result.primed).toEqual([
+      { ref: { pkg: "d3", version: "7" }, url: "/_m/d3@7" },
+      { ref: { pkg: "katex", version: "0.16" }, url: "/_m/katex@0.16" },
+    ]);
+  });
+
   it("returns immediately for an empty ref list", async () => {
     const prime = vi.fn();
     const result = await primeModules({ prime } as never, []);
@@ -32,7 +63,9 @@ describe("primeModules", () => {
     expect(result).toEqual({ primed: [], failed: [] });
   });
 
-  it("primes serially by default so a cold cache is not hammered concurrently", async () => {
+  // Serial, full stop — there is no option that makes it concurrent, and the doc comment no
+  // longer implies one.
+  it("primes serially so a cold cache is not hammered concurrently", async () => {
     const order: string[] = [];
     const prime = async (ref: { pkg: string }) => {
       order.push(`start:${ref.pkg}`);
