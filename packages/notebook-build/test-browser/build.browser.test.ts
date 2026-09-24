@@ -35,15 +35,15 @@ const HOSTED_PORT = 8792;
 const STATIC_PORT = 8793;
 
 /**
- * Cell ids on the PAGE are not the ids `parseMarkdown` hands out. `parseMarkdown` numbers from 0,
- * and the build round-trips the notebook through notebook-kit's `serialize`/`deserialize` (the
- * artifact in `cache` is the handoff between `[Notebook]` and `[Page]`) — whose `deserialize`
- * treats an id that is not a positive integer as absent and renumbers from 1, which then collides
- * with every following id and renumbers those too. So a 4-cell document parsed as 0/1/2/3 is
- * rendered as 1/2/3/4. That is invisible to every string test in this package, and it is exactly
- * the kind of thing only loading the page can pin.
+ * Cell ids are 1-based, and the build round-trips the notebook through notebook-kit's
+ * `serialize`/`deserialize` (the artifact in `cache` is the handoff between `[Notebook]` and
+ * `[Page]`) without moving them — `src/serialize.test.ts` holds that fixed point. This test is
+ * what originally exposed the divergence: `parseMarkdown` numbered from 0, `deserialize` treats a
+ * non-positive id as absent and renumbered the whole document, and the plot turned up in `cell-4`
+ * of a document whose cells had been parsed as 0..3. If that ever regresses, the hard-coded ids
+ * below stop matching and this file goes red.
  *
- * Here: `# Chart` is prose (page cell 1), then the import (2), the data (3) and the display (4).
+ * Here: `# Chart` is prose (cell 1), then the import (2), the data (3) and the display (4).
  * Cell 4 is the only one that renders anything, which is what makes "the plot landed in its own
  * root" a real assertion rather than a count of `svg` elements anywhere on the page.
  */
@@ -65,7 +65,7 @@ const CHART_MD = [
 ].join("\n");
 
 /**
- * No prose, so the page cells are 1/2/3 (see the renumbering note above). The middle one does not
+ * No prose, so the cells are 1/2/3. The middle one does not
  * parse. Cell 3 reads `ok` from cell 1 and displays `3`: if the broken cell had taken the graph
  * down with it, or if the build had stopped emitting definitions at the first failure, cell 3
  * would stay empty — and a test that only looked for the error message would still pass.

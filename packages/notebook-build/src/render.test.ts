@@ -13,8 +13,8 @@ const render = (src: string) => {
 describe("renderPage", () => {
   it("emits one root element per cell, carrying the cell id", () => {
     const html = render("# T\n\n```js\n1\n```\n\n```js\n2\n```\n");
-    expect(html).toContain('id="cell-0"');
     expect(html).toContain('id="cell-1"');
+    expect(html).toContain('id="cell-2"');
   });
 
   it("imports the runtime from the pinned URL", () => {

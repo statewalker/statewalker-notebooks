@@ -11,15 +11,36 @@ function nodeDom() {
 }
 
 describe("serializeNotebook", () => {
-  it("round-trips through notebook-kit's own deserialize", () => {
+  // `id` is compared here on purpose, and it is the point of the test rather than a detail.
+  // Comparing only `mode`/`value` is what let a real defect live: `parseMarkdown` numbered from
+  // 0, `deserialize` treats a non-positive id as absent and renumbers the whole document from 1,
+  // and every cell silently shifted by one on the way to the page — invisible to 72 tests,
+  // because none of them compared an id across the round trip. The artifact in `cache` is the
+  // handoff between `[Notebook]` and `[Page]` and is a document Observable Desktop can open and
+  // re-save, so it has to be a FIXED POINT: deserialize(serialize(nb)) must equal nb, ids
+  // included, or the two artifacts of one build disagree and a re-save changes the build hash.
+  it("round-trips through notebook-kit's own deserialize, ids included", () => {
     const dom = nodeDom();
-    const nb = parseMarkdown("# Round trip\n\n```js\nconst x = 1;\n```\n");
+    const nb = parseMarkdown(
+      "# Round trip\n\nprose\n\n```js\nconst x = 1;\n```\n\n```js\nconst y = 2;\n```\n",
+    );
     const html = serializeNotebook(nb, dom);
     const back = deserialize(html, { parser: dom.parser });
     expect(back.title).toBe("Round trip");
-    expect(back.cells.map((c) => [c.mode, c.value])).toEqual(
-      nb.cells.map((c) => [c.mode, c.value]),
+    expect(back.cells.map((c) => [c.id, c.mode, c.value])).toEqual(
+      nb.cells.map((c) => [c.id, c.mode, c.value]),
     );
+  });
+
+  // The same fixed-point property stated from the other side: a second round trip must not move
+  // anything either. A renumbering that happened to be self-consistent on the first pass but
+  // drifted on the second would slip past the assertion above.
+  it("is a fixed point: a second round trip changes nothing", () => {
+    const dom = nodeDom();
+    const nb = parseMarkdown("# T\n\nprose\n\n```js\n1\n```\n\n```md\ntext\n```\n");
+    const once = serializeNotebook(nb, dom);
+    const twice = serializeNotebook(deserialize(once, { parser: dom.parser }), dom);
+    expect(twice).toBe(once);
   });
 
   it("produces a document Observable Desktop would recognise", () => {

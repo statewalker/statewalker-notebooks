@@ -41,7 +41,15 @@ export function parseMarkdown(source: string): Notebook {
   const { meta, body } = splitFrontMatter(source);
   const tokens = md.parse(body, {});
   const cells: CellSpec[] = [];
-  let id = 0;
+  // 1-based, not 0-based. notebook-kit's ids are positive integers throughout, and its
+  // `deserialize` treats anything that is not one as ABSENT: a cell numbered 0 is renumbered to
+  // `++maxCellId` = 1, which then collides with the cell we numbered 1, which is renumbered to 2,
+  // and so on down the document. Numbering from 0 therefore made the serialized artifact
+  // non-idempotent — `deserialize(serialize(nb)).cells[i].id !== nb.cells[i].id` — so the two
+  // artifacts of one build disagreed (`cache/….nb.html` carried 0..3 while `output/….html`
+  // carried cell-1..cell-4), and opening the artifact in Observable Desktop and saving it back
+  // rewrote every id, every byte, and with them the incremental build's content hash.
+  let id = 1;
   let prose: string[] = [];
   let title: string | undefined = meta.title;
 
