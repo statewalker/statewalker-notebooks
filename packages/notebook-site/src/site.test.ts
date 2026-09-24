@@ -17,6 +17,12 @@ async function seededOutput() {
   await writeText(output, "/My Notebook.html", "<!doctype html><title>Spaced</title>");
   await writeText(output, "/Notes/Été.html", "<!doctype html><title>Accented</title>");
   await writeText(output, "/100% done.csv", "pct\n100\n");
+  // Two pages that sit just past each endpoint's boundary. `/_m/*` and `/_events/*` are
+  // prefixes of a PATH SEGMENT, not of a string: `/_m*` and `/_events*` are the tidy-ups
+  // waiting to be made once you notice `basePath` already ends in a slash, and each would
+  // swallow the page below it. Nothing else in the suite would notice.
+  await writeText(output, "/_module-notes.html", "PAGE-NOT-MODULE");
+  await writeText(output, "/_eventsource-guide.html", "PAGE-NOT-EVENTS");
   return output;
 }
 
@@ -153,6 +159,68 @@ describe("newNotebookSite", () => {
     const res = await handler(new Request("http://h/_m/d3@7/index.js"));
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("served /_m/d3@7/index.js");
+  });
+
+  it("does not let the module server swallow a page whose name merely starts with the prefix", async () => {
+    const handler = newNotebookSite({
+      output: await seededOutput(),
+      moduleServer: { fetch: async () => new Response("MODULE", { status: 200 }) },
+    });
+    const res = await handler(new Request("http://h/_module-notes.html"));
+    expect(await res.text()).toBe("PAGE-NOT-MODULE");
+  });
+
+  it("does not let the events endpoint swallow a page whose name merely starts with the prefix", async () => {
+    const handler = newNotebookSite({ output: await seededOutput(), events: newPubSub() });
+    const res = await handler(new Request("http://h/_eventsource-guide.html"));
+    expect(await res.text()).toBe("PAGE-NOT-EVENTS");
+  });
+
+  // (5) `basePath` defaults to "/_m/" and `eventsPath` to "/_events" — opposite trailing-slash
+  // conventions, so whichever spelling a caller copies from the other option must still work.
+  // Only `basePath` used to be normalized, which made `eventsPath: "/_events/"` build
+  // `/_events//*`: it matches nothing, the page's `EventSource` retries forever, rebuild
+  // notifications never arrive, and nothing logs.
+  it("accepts a basePath spelled with or without a trailing slash", async () => {
+    for (const basePath of ["/_mods/", "/_mods"]) {
+      const handler = newNotebookSite({
+        output: await seededOutput(),
+        basePath,
+        moduleServer: {
+          fetch: async (req) => new Response(`served ${new URL(req.url).pathname}`),
+        },
+      });
+      const res = await handler(new Request("http://h/_mods/d3@7/index.js"));
+      expect(await res.text()).toBe("served /_mods/d3@7/index.js");
+    }
+  });
+
+  it("accepts an eventsPath spelled with or without a trailing slash", async () => {
+    for (const eventsPath of ["/_feed/", "/_feed"]) {
+      const events = newPubSub();
+      const handler = newNotebookSite({ output: await seededOutput(), events, eventsPath });
+      const res = await handler(new Request("http://h/_feed/build"));
+      expect(res.headers.get("content-type")).toBe("text/event-stream");
+      expect(events.subscriberCount("build")).toBe(1);
+      await res.body?.cancel();
+    }
+  });
+
+  // A root mount is not a configuration to be honoured quietly: `basePath: "/"` makes the module server
+  // claim the whole site, /index.html included, and the site then serves no pages at all.
+  it("refuses a basePath or eventsPath that would claim the site root", async () => {
+    for (const basePath of ["/", "", "  "]) {
+      expect(() =>
+        newNotebookSite({
+          output: new MemFilesApi(),
+          basePath,
+          moduleServer: { fetch: async () => new Response("MODULE") },
+        }),
+      ).toThrow(/basePath/);
+    }
+    expect(() =>
+      newNotebookSite({ output: new MemFilesApi(), events: newPubSub(), eventsPath: "/" }),
+    ).toThrow(/eventsPath/);
   });
 
   it("mounts the events handler under /_events", async () => {

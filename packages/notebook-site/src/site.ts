@@ -8,10 +8,14 @@ export interface NotebookSiteOptions {
   output: FilesApi;
   /** Hosted mode only. Omit for a static export, which has no module endpoint. */
   moduleServer?: { fetch(request: Request): Promise<Response> };
-  /** Mount prefix for module dependencies. Must match the build's basePath. */
+  /**
+   * Mount prefix for module dependencies. Must match the build's basePath. A trailing slash
+   * is optional — `"/_m/"` and `"/_m"` mount the same place. The site root is rejected.
+   */
   basePath?: string;
   /** Rebuild notifications. Omit to serve without an event stream. */
   events?: PubSub;
+  /** Mount prefix for the rebuild event stream. Same rules as {@link basePath}. */
   eventsPath?: string;
   /**
    * webrun-site-builder has NO default here: without it a directory request
@@ -36,13 +40,15 @@ export function newNotebookSite({
   // nothing may claim `/_m/*` — the request must fall through to `setFiles`
   // below and be served from (or 404 against) the materialized dependency.
   if (moduleServer) {
-    builder.setEndpoint(`${basePath.replace(/\/$/, "")}/*`, (request) =>
+    builder.setEndpoint(mountPattern("basePath", basePath), (request) =>
       moduleServer.fetch(request),
     );
   }
 
   if (events) {
-    builder.setEndpoint(`${eventsPath}/*`, (request) => events.handler(request));
+    builder.setEndpoint(mountPattern("eventsPath", eventsPath), (request) =>
+      events.handler(request),
+    );
   }
 
   // `withDecodedPaths`, not `output` directly: a URL pathname is percent-encoded, and nothing
@@ -58,4 +64,32 @@ export function newNotebookSite({
   });
 
   return builder.build();
+}
+
+/**
+ * Turn a mount option into a `URLPattern` pathname, identically for both options.
+ *
+ * The two defaults have opposite trailing-slash conventions — `"/_m/"` has one, `"/_events"`
+ * does not — so a caller who spells one by analogy with the other must still get a working
+ * mount. Only `basePath` used to be normalized; `eventsPath: "/_events/"` therefore built
+ * `/_events//*`, which matches nothing: the page's `EventSource` retried forever, rebuild
+ * notifications silently never arrived, and nothing logged.
+ *
+ * The trailing `/` before the wildcard is load-bearing and must not be tidied away. `/_m*`
+ * would match `/_module-notes.html`; `/_events*` would turn `/_eventsource-guide.html` into an
+ * SSE stream. The prefix is a prefix of path SEGMENTS, not of the string.
+ */
+function mountPattern(option: "basePath" | "eventsPath", value: string): string {
+  const trimmed = value.trim().replace(/\/+$/, "");
+  const prefix = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  if (prefix === "/") {
+    // Refused rather than honoured: this endpoint is matched before files, so at the root it
+    // claims the entire site — /index.html and every notebook page with it — and the site
+    // serves nothing. A silent all-pages outage is not a configuration worth supporting.
+    throw new Error(
+      `newNotebookSite: ${option} must not be the site root (got ${JSON.stringify(value)}); ` +
+        "an endpoint mounted there claims every page, including /index.html",
+    );
+  }
+  return `${prefix}/*`;
 }
