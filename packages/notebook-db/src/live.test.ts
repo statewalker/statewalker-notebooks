@@ -63,4 +63,33 @@ describe("newLiveDatabases", () => {
     await dbs.closeAll();
     expect(close).toHaveBeenCalledTimes(2);
   });
+
+  // (D5) `closeAll` empties the map after closing. Without that, the registry still holds every
+  // client it just closed: a second `closeAll` — a double teardown, a `beforeEach` that also
+  // runs in `afterAll`, a page unload racing an explicit close — calls `close()` on each `Db`
+  // AGAIN. Removing `clients.clear()` left the whole suite green before this test existed.
+  it("does not close a database twice when closeAll is called twice", async () => {
+    const close = vi.fn(async () => {});
+    const dbs = newLiveDatabases({
+      open: async () => ({ query: async () => [], exec: async () => {}, close }) as never,
+    });
+    await dbs.get("a");
+    await dbs.get("b");
+    await dbs.closeAll();
+    await dbs.closeAll();
+    expect(close).toHaveBeenCalledTimes(2);
+  });
+
+  // The other half of the same line: a name asked for again after teardown must be REOPENED.
+  // A registry that kept its entries would hand back a client whose `Db` is already closed, and
+  // the failure would surface later, in the query, as whatever the driver says about a closed
+  // handle.
+  it("reopens a database requested again after closeAll", async () => {
+    const open = vi.fn(async () => okDb());
+    const dbs = newLiveDatabases({ open });
+    await dbs.get("a");
+    await dbs.closeAll();
+    await dbs.get("a");
+    expect(open).toHaveBeenCalledTimes(2);
+  });
 });

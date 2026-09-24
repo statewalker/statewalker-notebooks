@@ -3,7 +3,6 @@ import { type NotebookDbClient, newDbClient } from "./client.js";
 
 export interface LiveDatabasesOptions {
   open(name: string): Promise<Db>;
-  onError?(name: string, error: unknown): void;
 }
 
 /**
@@ -20,7 +19,7 @@ export function newLiveDatabases(options: LiveDatabasesOptions): {
   get(name: string): Promise<NotebookDbClient>;
   closeAll(): Promise<void>;
 } {
-  const { open, onError } = options;
+  const { open } = options;
   const clients = new Map<string, Promise<NotebookDbClient>>();
 
   return {
@@ -33,7 +32,6 @@ export function newLiveDatabases(options: LiveDatabasesOptions): {
             // Delete on rejection BEFORE rethrowing: the map must not hold a rejected
             // promise, or every future `get(name)` replays this same failure forever.
             clients.delete(name);
-            onError?.(name, error);
             const reason = error instanceof Error ? error.message : String(error);
             throw new Error(`cannot open database "${name}": ${reason}`, { cause: error });
           });
@@ -42,6 +40,12 @@ export function newLiveDatabases(options: LiveDatabasesOptions): {
       return pending;
     },
 
+    /**
+     * Closes every database opened so far and EMPTIES the registry. Emptying it is not
+     * housekeeping: without it a second `closeAll` — a double teardown, an unload racing an
+     * explicit close — calls `close()` on every `Db` a second time, and a name requested again
+     * afterwards is handed back a client whose `Db` is already closed instead of a fresh one.
+     */
     async closeAll(): Promise<void> {
       const opened = [...clients.values()];
       clients.clear();
