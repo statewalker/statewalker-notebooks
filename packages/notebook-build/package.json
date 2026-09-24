@@ -21,17 +21,21 @@
     "prepack": "pnpm run build",
     "test": "pnpm run build && vitest run --passWithNoTests",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test-browser.json",
-    "test:browser": "vitest run test-browser --config vitest.browser.config.ts"
+    "test:browser": "pnpm --filter @statewalker/notebook-db run build && vitest run test-browser --config vitest.browser.config.ts"
   },
   "dependencies": {
     "@observablehq/notebook-kit": "^2.6.4",
     "markdown-it": "catalog:"
   },
   "devDependencies": {
+    "@duckdb/duckdb-wasm": "catalog:",
+    "@statewalker/db-duckdb-browser": "workspace:*",
+    "@statewalker/notebook-db": "workspace:*",
     "@statewalker/webrun-files-mem": "workspace:*",
     "@statewalker/webrun-files-node": "workspace:*",
     "@types/jsdom": "catalog:",
     "@types/markdown-it": "catalog:",
+    "esbuild": "^0.28.2",
     "jsdom": "catalog:",
     "playwright": "^1.63.0",
     "tsdown": "^0.23.0",

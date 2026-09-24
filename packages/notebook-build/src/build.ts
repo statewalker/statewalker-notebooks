@@ -539,7 +539,11 @@ function assertDistinctOutputs(cells: CellDefinition[], notebookPath: string): v
   const owner = new Map<string, number>();
   for (const cell of cells) {
     if (cell.error) continue;
-    for (const name of cell.outputs) {
+    // Plural AND singular. They are alternatives, never both on one cell: js/ts declare names
+    // through `outputs`, every other compiled mode (here, `sql`) through `output`. Checking
+    // only the plural form lets two SQL cells claim one name and publishes the half-running
+    // page this function exists to refuse.
+    for (const name of [...cell.outputs, ...(cell.output === undefined ? [] : [cell.output])]) {
       const first = owner.get(name);
       if (first !== undefined) {
         throw new Error(

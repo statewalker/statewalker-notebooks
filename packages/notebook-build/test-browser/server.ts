@@ -13,6 +13,7 @@
 // built output. Passing no `moduleServer` serves output only — which is exactly the condition a
 // static export has to survive, so that omission is a test, not a convenience.
 
+import { readFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { FilesApi } from "@statewalker/webrun-files";
 
@@ -28,6 +29,16 @@ export interface OutputServerOptions {
   moduleServer?: FetchHandlerLike;
   /** URL prefix the module server is mounted at; must match the build's. */
   basePath?: string;
+  /**
+   * URL path -> absolute file on disk, served straight from there and checked BEFORE `output`.
+   *
+   * This exists for one thing only: `@duckdb/duckdb-wasm`'s two `.wasm` bundles are 75 MB
+   * together, and the live-SQL fixture needs them on this origin. Copying them into the
+   * `MemFilesApi` output would hold that in memory once per server. They are fixture assets —
+   * the build never sees them and no notebook depends on them — so streaming them off disk
+   * changes nothing the tests assert. Still just "GET this path"; do not grow it further.
+   */
+  extraFiles?: ReadonlyMap<string, string>;
 }
 
 export interface OutputServer {
@@ -77,6 +88,7 @@ async function readAll(files: FilesApi, path: string): Promise<Uint8Array> {
 
 export async function startOutputServer(options: OutputServerOptions): Promise<OutputServer> {
   const { port, output, moduleServer } = options;
+  const extraFiles = options.extraFiles ?? new Map<string, string>();
   const basePath = options.basePath ?? "/_m/";
 
   const server: Server = createServer((req, res) => {
@@ -97,6 +109,17 @@ export async function startOutputServer(options: OutputServerOptions): Promise<O
             headers[key] = value;
           });
           res.writeHead(response.status, headers);
+          res.end(body);
+          return;
+        }
+
+        const onDisk = extraFiles.get(pathname);
+        if (onDisk !== undefined) {
+          const body = await readFile(onDisk);
+          res.writeHead(200, {
+            "content-type": mimeOf(pathname),
+            "content-length": String(body.length),
+          });
           res.end(body);
           return;
         }

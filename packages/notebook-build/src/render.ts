@@ -1,14 +1,11 @@
-import type { CellMode, Notebook } from "@observablehq/notebook-kit";
+import type { Notebook } from "@observablehq/notebook-kit";
 import MarkdownIt from "markdown-it";
-import type { CellDefinition } from "./transpile.js";
+import { type CellDefinition, CODE_MODES } from "./transpile.js";
 
 export interface RenderOptions {
   runtimeUrl: string;
   stylesUrl?: string;
 }
-
-/** Modes the transpile stage actually compiles; everything else arrives inert (see transpile.ts). */
-const CODE_MODES = new Set<CellMode>(["js", "ts", "ojs"]);
 
 const md = new MarkdownIt({ html: true });
 
@@ -57,10 +54,17 @@ function renderCellRoot(id: number, inner: string): string {
  */
 function renderDefineCall(cell: CellDefinition): string {
   const state = `{root: document.getElementById("cell-${cell.id}"), variables: [], expanded: []}`;
+  // `output` is notebook-kit's SINGULAR output name, set for every non-js/ts/ojs mode — here,
+  // `sql`. `define()` names the cell's variable `output ?? (outputs.length ? \`cell ${id}\` :
+  // null)`, so omitting it leaves a sql cell anonymous: it still renders its own result, and
+  // every cell downstream that names it waits for ever with no error anywhere. The key is
+  // emitted only when there is one — `{"output": undefined}` is not valid JSON, and `define()`
+  // branches on `output != null`.
+  const output = cell.output === undefined ? "" : `"output":${JSON.stringify(cell.output)},`;
   const definition =
     `{"id":${cell.id},"body":${cell.body},` +
     `"inputs":${JSON.stringify(cell.inputs)},"outputs":${JSON.stringify(cell.outputs)},` +
-    `"autodisplay":${JSON.stringify(cell.autodisplay)}}`;
+    `${output}"autodisplay":${JSON.stringify(cell.autodisplay)}}`;
   return `define(${state}, ${definition});`;
 }
 
@@ -80,8 +84,11 @@ export function renderPage(nb: Notebook, cells: CellDefinition[], options: Rende
 
   for (const cell of cells) {
     if (!CODE_MODES.has(cell.mode)) {
-      // "md" cells, plus every mode the transpile stage does not yet wire up (sql/html/tex/dot/
-      // python/r — see the GAP comment in transpile.ts): render as inert prose, the same as md.
+      // "md" cells, plus every mode the transpile stage deliberately leaves inert (html/tex/
+      // dot/node/python/r/sql.view — see the note on CODE_MODES in transpile.ts): render as
+      // prose, the same as md. The set is IMPORTED from the transpile stage rather than
+      // restated, so widening it there can never leave a compiled cell being laid out here as
+      // text.
       // Verbatim: this is document body, not script content. See `escapeScriptClose`.
       const html = md.render(source.get(cell.id) ?? "");
       roots.push(renderCellRoot(cell.id, html));

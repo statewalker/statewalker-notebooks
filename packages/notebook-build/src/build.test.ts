@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { toNotebook } from "@observablehq/notebook-kit";
 import { type FilesApi, readText, writeText } from "@statewalker/webrun-files";
 import { MemFilesApi } from "@statewalker/webrun-files-mem";
 import { NodeFilesApi } from "@statewalker/webrun-files-node";
@@ -258,6 +259,35 @@ describe("newNotebookBuild", () => {
 
     expect(failures.at(-1)?.map((f) => f.notebookPath)).toEqual(["/n.md"]);
     expect(String(failures.at(-1)?.[0]?.error)).toMatch(/"x"/);
+    expect(await output.exists("/n.html")).toBe(false);
+  });
+
+  // The same defect, one output class over. A `sql` cell declares its name through the
+  // SINGULAR `output`, not through `outputs`, so a check that reads only `outputs` sees two
+  // cells declaring nothing and publishes a page whose second SQL cell — and everything
+  // downstream of it — never resolves, with no error anywhere.
+  it("fails a notebook whose sql cells declare the same singular output twice", async () => {
+    const notebooks = new MemFilesApi();
+    await writeText(
+      notebooks,
+      "/n.html",
+      serializeNotebook(
+        toNotebook({
+          title: "N",
+          cells: [
+            { id: 1, mode: "sql", value: "SELECT 1", database: "w", output: "rows" },
+            { id: 2, mode: "sql", value: "SELECT 2", database: "w", output: "rows" },
+          ],
+        }),
+        nodeDom(),
+      ),
+    );
+    const output = new MemFilesApi();
+    const failures: NotebookFailure[][] = [];
+    await build(notebooks, output, { onFailed: (f) => failures.push(f) }).build();
+
+    expect(failures.at(-1)?.map((f) => f.notebookPath)).toEqual(["/n.html"]);
+    expect(String(failures.at(-1)?.[0]?.error)).toMatch(/"rows"/);
     expect(await output.exists("/n.html")).toBe(false);
   });
 });

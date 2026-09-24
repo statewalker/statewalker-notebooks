@@ -25,6 +25,13 @@ export class ResolveError extends Error {
   }
 }
 
+/**
+ * Deliberately NARROWER than the transpile stage's `CODE_MODES`, which also compiles `sql`.
+ * This set answers "which cells can contain an import specifier", and a `sql` cell cannot: its
+ * value is SQL text that notebook-kit turns into a tagged template, so it has no import
+ * declaration and no `import()` for the walker below to find. Any future mode admitted here
+ * must be one whose source is JavaScript.
+ */
 const CODE_MODES = new Set(["js", "ts", "ojs"]);
 
 /**

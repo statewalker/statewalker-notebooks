@@ -3,8 +3,8 @@
 Turns a tree of notebooks on a [`FilesApi`](https://github.com/statewalker/webrun-files) into a
 static site of executable pages, incrementally.
 
-A notebook is a Markdown file (fenced `js`/`ts`/`ojs` blocks become cells, everything else is
-prose) or an [Observable notebook-kit](https://github.com/observablehq/notebook-kit) HTML
+A notebook is a Markdown file (fenced `js`/`ts`/`ojs`/`sql` blocks become cells, everything else
+is prose) or an [Observable notebook-kit](https://github.com/observablehq/notebook-kit) HTML
 document. Each one becomes an `.html` page that imports notebook-kit's runtime and runs its own
 cell graph in the browser.
 
@@ -51,6 +51,47 @@ The three `FilesApi` instances must be three distinct directories. The build wri
 probe file to prove it, because two handles on one directory would feed the build's own output
 back in as sources.
 
+## Cell modes
+
+`js`, `ts`, `ojs` and `sql` cells are compiled and run in the page; every other mode renders as
+prose.
+
+### SQL cells
+
+A SQL cell's `database` and `output` attributes are what make it work, and only a notebook-kit
+HTML source can carry them — a Markdown fence has no syntax for an attribute.
+
+`database` picks the mode, and the two are notebook-kit's, not this package's:
+
+- `database="var:db"` (the default) is **live**: the cell compiles to
+  ``DatabaseClient.of(db, "db").sql`…` `` and queries whatever the notebook's own `db` variable
+  is. Any object with a `sql` tagged-template function will do — for instance a
+  [`@statewalker/notebook-db`](https://www.npmjs.com/package/@statewalker/notebook-db) client
+  over a `@statewalker/db-api` `Db`.
+- `database="warehouse"` is **precomputed**: notebook-kit's client runs no SQL at all. It
+  fetches `.observable/cache/<nameHash>-<hash>.json`, and that path is relative to the PAGE, so
+  a notebook at `/reports/q3.html` reads `/reports/.observable/cache/…`. Writing those files is
+  `@statewalker/notebook-db`'s `precomputeQueries`.
+
+`output="revenue"` exposes the cell's rows to the rest of the notebook. It is notebook-kit's
+*singular* output — `outputs` stays empty for a SQL cell — and two cells claiming one name fail
+the build exactly as two `const x` cells do.
+
+SQL results render through notebook-kit's default inspector. notebook-kit's own Vite plugin
+uses `displayMode: "table"` instead; this package does not, because that display path is
+`import("…/stdlib/inputs.js")`, whose first line imports `@observablehq/inputs` from jsDelivr.
+
+### The modes that stay prose
+
+Not "unsupported": notebook-kit's `transpile()` returns a real body for each of them. They are
+left inert because the body cannot run in a page this build produces.
+
+| mode | why |
+| --- | --- |
+| `html`, `tex`, `dot`, `sql.view` | need the `htl`, `tex`, `dot` and `Inputs` builtins, each of which notebook-kit loads from `cdn.jsdelivr.net`. A static export that reaches a CDN is not a static export. |
+| `node`, `python`, `r` | are data-loader cells: `Interpreter(…).run(src)` fetches `.observable/cache/<hash>.bin`, an artifact a build-time interpreter stage produces. This build has none, so every such cell would 404 — worse than rendering inert. |
+| `md` | is rendered at build time with markdown-it, into the document body, so prose is readable with JavaScript off. |
+
 ## What is published
 
 For `/reports/q3.md`:
@@ -78,5 +119,5 @@ reported as failures rather than one silently overwriting the other.
 
 ## Status
 
-`sql`, `html`, `tex`, `dot`, `python` and `r` cells parse and render as inert prose: they are
-not executed yet.
+`html`, `tex`, `dot`, `sql.view`, `node`, `python` and `r` cells parse and render as inert
+prose — see "Cell modes" above for why each one is left out rather than wired up.

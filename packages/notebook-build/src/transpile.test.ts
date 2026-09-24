@@ -1,3 +1,4 @@
+import { type CellSpec, toNotebook } from "@observablehq/notebook-kit";
 import { describe, expect, it } from "vitest";
 import { parseMarkdown } from "./md-parse.js";
 import { transpileNotebook } from "./transpile.js";
@@ -66,4 +67,66 @@ describe("transpileNotebook", () => {
     });
     expect(prose.error).toBeUndefined();
   });
+});
+
+/**
+ * A notebook built from raw cell specs, because `parseMarkdown` cannot express a `sql` cell's
+ * `output` or `database` attributes — only a notebook-kit HTML source can, and that is exactly
+ * what the build feeds this stage (`emitPage` re-parses the serialized artifact).
+ */
+const nbOf = (...cells: CellSpec[]) => toNotebook({ cells });
+
+describe("transpileNotebook, sql cells", () => {
+  // notebook-kit's `transpile()` (dist/src/javascript/transpile.js) routes every non-js/ts/ojs
+  // mode through `transpileTemplate` and then sets a SINGULAR `output` from `cell.output` —
+  // never the plural `outputs`, which stays empty. Measured by running it, not read off a .d.ts.
+  it("compiles a sql cell into a body that queries its database", () => {
+    const cell = transpileNotebook(
+      nbOf({ id: 1, mode: "sql", value: "SELECT 1 AS n", output: "myTable" }),
+      new Map(),
+    )[0]!;
+    expect(cell.error).toBeUndefined();
+    expect(cell.body).not.toBe("");
+    expect(cell.body).toContain("DatabaseClient");
+    expect(cell.body).toContain("SELECT 1 AS n");
+    expect(cell.inputs).toContain("DatabaseClient");
+  });
+
+  it("carries the singular output name notebook-kit sets for a sql cell", () => {
+    const cell = transpileNotebook(
+      nbOf({ id: 1, mode: "sql", value: "SELECT 1 AS n", output: "myTable" }),
+      new Map(),
+    )[0]!;
+    // Singular, not plural: `outputs` is empty for every non-js/ts/ojs mode, so a renderer
+    // that only reads `outputs` emits a define nothing downstream can name.
+    expect(cell.output).toBe("myTable");
+    expect(cell.outputs).toEqual([]);
+  });
+
+  it("leaves `output` undefined for a js cell, which notebook-kit never sets it on", () => {
+    const cell = transpileNotebook(
+      nbOf({ id: 1, mode: "js", value: "const answer = 42;" }),
+      new Map(),
+    )[0]!;
+    expect(cell.output).toBeUndefined();
+    expect(cell.outputs).toContain("answer");
+  });
+});
+
+/**
+ * The modes deliberately NOT widened into `CODE_MODES`, each for a reason that was measured
+ * rather than assumed. See the note on `CODE_MODES` in transpile.ts.
+ */
+describe("transpileNotebook, the modes that stay inert", () => {
+  for (const mode of ["html", "tex", "dot", "python", "r", "node", "sql.view"] as const) {
+    it(`emits a ${mode} cell inert rather than as a cell that cannot run`, () => {
+      const cell = transpileNotebook(
+        nbOf({ id: 1, mode, value: "x", output: "out" }),
+        new Map(),
+      )[0]!;
+      expect(cell.body).toBe("");
+      expect(cell.output).toBeUndefined();
+      expect(cell.error).toBeUndefined();
+    });
+  }
 });

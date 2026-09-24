@@ -27,6 +27,30 @@ const rows2 = await client.query("SELECT * FROM t WHERE id = ?", [id]);
 await client.close();
 ```
 
+## Live databases in a page
+
+`newLiveDatabases` is the registry a built notebook page wires a **live** SQL cell to. A SQL
+cell whose `database` is `var:db` compiles to ``DatabaseClient.of(db, "db").sql`…` ``, so the
+notebook needs a `db` variable holding something with a `sql` tagged template — which is what
+`get(name)` resolves to.
+
+```ts
+import { newLiveDatabases } from "@statewalker/notebook-db";
+import { newBrowserDuckDb } from "@statewalker/db-duckdb-browser";
+
+const databases = newLiveDatabases({ open: () => newBrowserDuckDb({ bundles }) });
+
+// in the notebook's own js cell:
+const db = await databases.get("warehouse");
+```
+
+A database is opened on first use and reused after; two callers racing the first `get` share one
+`open`. A *rejected* open is not cached — OPFS can be unavailable and a wasm bundle can be
+blocked, and both are transient — and the rejection is rewrapped with the database name, because
+"OPFS unavailable" on its own does not say which cell to fix. `closeAll()` closes every database
+opened so far and empties the registry, so a second teardown does not close them twice and a name
+requested afterwards gets a fresh database rather than a closed one.
+
 ## Parameter binding
 
 Interpolations in the tagged template become bound parameters — `strings.join("?")` for the SQL

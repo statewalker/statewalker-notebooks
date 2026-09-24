@@ -1,3 +1,4 @@
+import { type CellSpec, toNotebook } from "@observablehq/notebook-kit";
 import { JSDOM } from "jsdom";
 import { describe, expect, it } from "vitest";
 import { parseMarkdown } from "./md-parse.js";
@@ -129,5 +130,65 @@ describe("renderPage", () => {
     const link = parse(html).querySelector("link");
     expect(link?.getAttribute("onload")).toBe(null);
     expect(link?.getAttribute("href")).toBe('/s.css" onload="boom()');
+  });
+});
+
+/** Renders a notebook built from raw cell specs — the only way to express `output`/`database`. */
+const renderCells = (...cells: CellSpec[]) => {
+  const nb = toNotebook({ cells });
+  return renderPage(nb, transpileNotebook(nb, new Map()), { runtimeUrl: RUNTIME_URL });
+};
+
+describe("renderPage, cells with a singular output", () => {
+  const sqlCell: CellSpec = {
+    id: 1,
+    mode: "sql",
+    value: "SELECT 1 AS n",
+    database: "warehouse",
+    output: "myTable",
+  };
+
+  // Half two of the pair. Widening the transpile stage alone gives a cell with a real body
+  // that the renderer still lays out as prose, so it never runs: this is the assertion that
+  // catches that state.
+  it("emits a define for a sql cell instead of rendering it as prose", () => {
+    const html = renderCells(sqlCell);
+    const script = parse(html).querySelector('script[type="module"]')?.textContent ?? "";
+    expect(script).toContain("define(");
+    expect(script).toContain("DatabaseClient");
+    // The query text must not have leaked into the document body as markdown prose.
+    expect(parse(html).querySelector("#cell-1")?.textContent).toBe("");
+  });
+
+  // notebook-kit's `define()` computes `vid = output ?? (outputs.length ? \`cell ${id}\` : null)`
+  // and, when `output != null`, defines the cell's variable under that name. Dropping the field
+  // leaves the cell anonymous: it still renders, and every downstream cell referencing the name
+  // stays permanently unresolved. That failure is silent — no error, just an empty cell.
+  it("names the cell's variable with the singular output", () => {
+    const script =
+      parse(renderCells(sqlCell)).querySelector('script[type="module"]')?.textContent ?? "";
+    expect(script).toContain('"output":"myTable"');
+  });
+
+  it("omits the output key entirely for a cell that has none", () => {
+    const script =
+      parse(renderCells({ id: 1, mode: "js", value: "const answer = 42;" })).querySelector(
+        'script[type="module"]',
+      )?.textContent ?? "";
+    expect(script).toContain('"outputs":["answer"]');
+    expect(script).not.toContain('"output"');
+  });
+
+  // A downstream js cell must be able to read the sql cell's rows by name; that is the whole
+  // point of carrying `output` through, and it is what the browser test then runs for real.
+  it("keeps a downstream cell's reference to the sql cell's output", () => {
+    const html = renderCells(sqlCell, {
+      id: 2,
+      mode: "js",
+      value: "display(myTable.length);",
+    });
+    const script = parse(html).querySelector('script[type="module"]')?.textContent ?? "";
+    expect(script).toContain('"output":"myTable"');
+    expect(script).toContain('"inputs":["display","myTable"]');
   });
 });

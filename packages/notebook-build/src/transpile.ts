@@ -6,13 +6,55 @@ export interface CellDefinition {
   body: string;
   inputs: string[];
   outputs: string[];
+  /**
+   * The SINGULAR output name, which notebook-kit sets for every mode that is not js/ts/ojs
+   * (`transpile.js`: `if (mode !== "ts" && mode !== "js" && mode !== "ojs") transpiled.output =
+   * cell.output`). It is an ALTERNATIVE to `outputs`, not an addition: a cell that has one has
+   * an empty other. notebook-kit's `define()` reads it to name the cell's variable, so a
+   * renderer that drops it emits a definition no downstream cell can reference.
+   */
+  output?: string;
   autodisplay: boolean;
   mode: CellMode;
   /** Set when the cell did not compile; the page renders this in its place. */
   error?: string;
 }
 
-const CODE_MODES = new Set<CellMode>(["js", "ts", "ojs"]);
+/**
+ * The modes this build compiles and the page can actually run. Exported because `render.ts`
+ * must gate on the SAME set: two copies drifted apart is precisely how a widened transpile
+ * yields cells that compile and are then rendered as prose.
+ *
+ * Why `sql` and nothing else, measured against the installed notebook-kit 2.6.4 rather than
+ * inferred — `transpile()` returns a real body for EVERY mode below, so "notebook-kit supports
+ * it" is not the test. The test is whether the body can run in a page this build produces:
+ *
+ *  * `sql` — body is `(await DatabaseClient.of(db, "db")).sql\`…\`` (a live database from a
+ *    notebook variable) or `DatabaseClient("name", {id}).sql\`…\`` (a precomputed
+ *    `.observable/cache/…json` fetch). `DatabaseClient` is defined directly in the runtime's
+ *    `stdlib/index.js`, and both paths stay on this origin. IN.
+ *  * `html`, `tex`, `dot` — the bodies need the `htl`, `tex` and `dot` builtins, and all three
+ *    resolve through `stdlib/recommendedLibraries.js` to a literal
+ *    `import("https://cdn.jsdelivr.net/npm/…")` (`tex.js` and `dot.js` import katex and
+ *    @viz-js/viz from jsDelivr at module scope). A static export that reaches a CDN is not a
+ *    static export; the browser suite asserts zero off-origin requests. OUT.
+ *  * `node`, `python`, `r` — `Interpreter(mode, …).run(source)` does not execute anything: it
+ *    is `FileAttachment(".observable/cache/<hash>.bin")`, a fetch of an artifact produced by a
+ *    build-time data loader. This build has no interpreter stage, so every such cell would
+ *    404. A cell that transpiles and then silently fails is worse than an inert one. OUT.
+ *  * `sql.view` — body returns a `SqlView`, which is only useful with `displayMode: "table"`,
+ *    and that display path is `import("./stdlib/inputs.js")`, whose first line is
+ *    `export * from "https://cdn.jsdelivr.net/npm/@observablehq/inputs/+esm"`. Off-origin
+ *    again, and without it the cell inspects an opaque query object. OUT.
+ *  * `md` — has a body (`md\`…\``) and would work, but this build renders prose at BUILD time
+ *    with markdown-it, into the document body, so it is readable with JavaScript disabled and
+ *    costs the page nothing. Compiling it instead would be a regression, not a fix. OUT.
+ *
+ * For the same reason `displayMode` is not emitted anywhere in this package: notebook-kit's
+ * own Vite plugin sets `displayMode: "table"` for `sql` cells, and that is the `inputs.js`
+ * CDN path above. SQL results render through the default inspector here.
+ */
+export const CODE_MODES = new Set<CellMode>(["js", "ts", "ojs", "sql"]);
 
 /**
  * Transpiles every code cell in `nb` against the module pin map produced by `resolveNotebook`.
@@ -29,19 +71,9 @@ export function transpileNotebook(nb: Notebook, pins: PinMap): CellDefinition[] 
 
   return nb.cells.map((cell: Cell): CellDefinition => {
     if (!CODE_MODES.has(cell.mode)) {
-      // Prose cells are not transpiled; they pass through with empty inputs/outputs so the
-      // renderer can lay them out in document order alongside code cells.
-      //
-      // GAP: this branch also swallows every non-js/ts/ojs *executable* mode (sql, html, tex,
-      // dot, python, r) as if it were inert prose, dropping `cell.output` on the floor.
-      // notebook-kit's `transpile()` does support these modes — it returns a `body` plus a
-      // singular `output` (not the plural `outputs` js/ts/ojs use) for them — so they are not
-      // unsupported, just unwired here. Closing this needs two things together, not one:
-      // widening CODE_MODES to include them, AND teaching the renderer (a later stage) to
-      // consume a singular `output` alongside plural `outputs`. Do not widen CODE_MODES alone:
-      // a sql/html/... cell would then transpile but the renderer — which currently treats
-      // every non-code mode as prose — would never render it. Tracked for the SQL-cell work in
-      // a later plan.
+      // Prose cells, and every mode deliberately left out of CODE_MODES above, pass through
+      // with empty inputs/outputs and no `output`, so the renderer lays them out in document
+      // order as prose alongside code cells.
       return {
         id: cell.id,
         body: "",
@@ -58,6 +90,10 @@ export function transpileNotebook(nb: Notebook, pins: PinMap): CellDefinition[] 
         body: t.body,
         inputs: t.inputs ?? [],
         outputs: t.outputs ?? [],
+        // Spread rather than `output: t.output`: `exactOptionalPropertyTypes` refuses an
+        // explicit `undefined` for an optional field, and a cell with no singular output must
+        // not carry the key at all — `renderDefineCall` decides on its presence.
+        ...(t.output === undefined ? {} : { output: t.output }),
         autodisplay: t.autodisplay ?? false,
         mode: cell.mode,
       };
