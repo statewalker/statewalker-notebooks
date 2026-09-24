@@ -8,6 +8,7 @@ import {
   SOURCES_SIGNAL,
 } from "@statewalker/webrun-builder";
 import {
+  dirname,
   extname,
   type FilesApi,
   joinPath,
@@ -30,7 +31,7 @@ import {
   toModuleRef,
 } from "./resolve.js";
 import { type DomEnv, notebookHash, serializeNotebook } from "./serialize.js";
-import { transpileNotebook } from "./transpile.js";
+import { type CellDefinition, transpileNotebook } from "./transpile.js";
 
 /** Where the build's own state lives: engine stores in `notebooks`, sidecars in `cache`. */
 const SYSTEM_FOLDER = ".notebook-build";
@@ -200,6 +201,30 @@ function pagePath(uri: string): string {
   return `${ext ? path.slice(0, -ext.length) : path}.html`;
 }
 
+/**
+ * The other notebook sources that would publish to the same page path as `uri`.
+ *
+ * `pagePath` strips the extension and appends `.html`, and `NOTEBOOK_EXT` accepts `.md` and
+ * `.html`, so `/report.md` and `/report.html` are two notebooks with one destination. Left
+ * undetected that was silent: two manifests claimed the same output, whichever ran last won,
+ * and deleting the loser left the winner's page serving for ever — its hash was unchanged so
+ * it never re-rendered, and the prune correctly refused to remove a path another manifest
+ * still claimed. The directory is listed rather than the two extensions probed, so a
+ * `.MD`/`.md` pair is caught as well.
+ */
+async function collidingSources(host: Host, uri: string): Promise<string[]> {
+  const path = sourcePath(uri);
+  const target = pagePath(uri);
+  const found: string[] = [];
+  for await (const info of host.notebooks.list(dirname(path))) {
+    if (info.kind !== "file") continue;
+    const other = joinPath("/", info.path);
+    if (other === path || !NOTEBOOK_EXT.test(other)) continue;
+    if (pagePath(other.slice(1)) === target) found.push(other);
+  }
+  return found.sort();
+}
+
 function sidecarPath(uri: string, suffix: string): string {
   return joinPath("/", SYSTEM_FOLDER, `${uri}${suffix}`);
 }
@@ -360,8 +385,10 @@ async function emitPage(host: Host, uri: string): Promise<void> {
   const nb = parseNotebookHtml(serialized, host.dom);
 
   const pins = await resolveNotebook(nb, { moduleServer: host.resolver }, notebookPath);
+  const cells = transpileNotebook(nb, pins);
+  assertDistinctOutputs(cells, notebookPath);
   const runtimeUrl = await runtimeUrlOf(host);
-  const page = renderPage(nb, transpileNotebook(nb, pins), {
+  const page = renderPage(nb, cells, {
     runtimeUrl,
     ...(host.stylesUrl === undefined ? {} : { stylesUrl: host.stylesUrl }),
   });
@@ -399,6 +426,28 @@ async function emitPage(host: Host, uri: string): Promise<void> {
   // The closure is part of what changed: a deploy driven off `changed` that uploads the page
   // and none of its dependencies publishes a site whose every module 404s.
   for (const path of [pagePathOf, ...assets.map((a) => a.path), ...deps]) host.changed.add(path);
+}
+
+/**
+ * Two cells declaring the same name is not a style question: notebook-kit's runtime refuses the
+ * second definition of a variable, so the page half-runs — the offending cell and everything
+ * downstream of it stay empty while the rest looks fine. It is the author's mistake, and it was
+ * being published silently.
+ */
+function assertDistinctOutputs(cells: CellDefinition[], notebookPath: string): void {
+  const owner = new Map<string, number>();
+  for (const cell of cells) {
+    if (cell.error) continue;
+    for (const name of cell.outputs) {
+      const first = owner.get(name);
+      if (first !== undefined) {
+        throw new Error(
+          `${notebookPath}: "${name}" is declared by two cells (cell ${first} and cell ${cell.id})`,
+        );
+      }
+      owner.set(name, cell.id);
+    }
+  }
 }
 
 function writeManifest(host: Host, uri: string, manifest: Manifest): Promise<void> {
@@ -477,6 +526,14 @@ function notebookBuilders(): RegisteredBuilder<Host>[] {
             (await host.notebooks.exists(sourcePath(update.uri)))
           ) {
             try {
+              const collisions = await collidingSources(host, update.uri);
+              if (collisions.length > 0) {
+                throw new Error(
+                  `${sourcePath(update.uri)}: ${[sourcePath(update.uri), ...collisions].join(
+                    " and ",
+                  )} all publish to ${pagePath(update.uri)} — rename all but one`,
+                );
+              }
               const text = await readText(host.notebooks, sourcePath(update.uri));
               const serialized = serializeNotebook(
                 parseSource(text, update.uri, host.dom),

@@ -2,9 +2,11 @@ import { type FilesApi, readText, writeText } from "@statewalker/webrun-files";
 import { MemFilesApi } from "@statewalker/webrun-files-mem";
 import { JSDOM } from "jsdom";
 import { describe, expect, it } from "vitest";
-import { newNotebookBuild } from "./build.js";
+import { type NotebookFailure, newNotebookBuild } from "./build.js";
 import type { ModuleServerLike } from "./deps.js";
+import { parseMarkdown } from "./md-parse.js";
 import type { ModuleRef } from "./resolve.js";
+import { serializeNotebook } from "./serialize.js";
 
 /** Under Node there is no DOM; the browser injects its own natives instead. */
 function nodeDom() {
@@ -52,6 +54,7 @@ const build = (
   notebooks: FilesApi,
   output: FilesApi,
   extra: {
+    onFailed?: (failures: NotebookFailure[]) => void;
     onRebuilt?: (changed: string[]) => void;
     moduleServer?: ModuleServerLike;
     mode?: "hosted" | "static";
@@ -65,6 +68,7 @@ const build = (
     moduleServer: extra.moduleServer ?? fakeServer().server,
     dom: nodeDom(),
     mode: extra.mode ?? "hosted",
+    ...(extra.onFailed ? { onFailed: extra.onFailed } : {}),
     ...(extra.onRebuilt ? { onRebuilt: extra.onRebuilt } : {}),
     ...(extra.stylesUrl ? { stylesUrl: extra.stylesUrl } : {}),
   });
@@ -162,5 +166,60 @@ describe("newNotebookBuild", () => {
     // `define` 404s is a blank page. Its name is scoped, so this also exercises the
     // `(@scope/)?name@version` package-root grammar.
     expect(await output.exists("/_m/@observablehq/notebook-kit@1/index.js")).toBe(true);
+  });
+
+  // `pagePath` strips the extension and appends `.html`, and `NOTEBOOK_EXT` accepts both `.md`
+  // and `.html` — so `/report.md` and `/report.html` both claim `/report.html`. Measured
+  // before this check: zero reported failures, one output file, two manifests both claiming
+  // the same path. Deleting `report.md` then left `/report.html` serving its content for
+  // ever: the survivor's hash was unchanged so it never re-rendered, and the prune correctly
+  // refused to remove a path another manifest still claimed.
+  it("fails both notebooks when two sources claim the same page path", async () => {
+    const notebooks = new MemFilesApi();
+    const { window } = new JSDOM("<!doctype html>");
+    await writeText(notebooks, "/report.md", "# MD\n\n```js\nconst x = 1;\n```\n");
+    await writeText(
+      notebooks,
+      "/report.html",
+      serializeNotebook(parseMarkdown("# HTML\n\n```js\nconst y = 2;\n```\n"), {
+        document: window.document,
+        parser: new window.DOMParser(),
+      }),
+    );
+    const output = new MemFilesApi();
+    const failures: NotebookFailure[][] = [];
+    await build(notebooks, output, { onFailed: (f) => failures.push(f) }).build();
+
+    expect(
+      failures
+        .at(-1)
+        ?.map((f) => f.notebookPath)
+        .sort(),
+    ).toEqual(["/report.html", "/report.md"]);
+    // Both source paths are named, so the author knows which two files to reconcile.
+    for (const failure of failures.at(-1) ?? []) {
+      expect(String(failure.error)).toContain("/report.md");
+      expect(String(failure.error)).toContain("/report.html");
+    }
+    // No winner is picked: neither notebook's content is published under the contested path.
+    expect(await output.exists("/report.html")).toBe(false);
+  });
+
+  // M7: two cells declaring the same name is not a style question — notebook-kit's runtime
+  // refuses the second definition, so the page half-runs. It used to build silently.
+  it("fails a notebook whose cells declare the same output name twice", async () => {
+    const notebooks = new MemFilesApi();
+    await writeText(
+      notebooks,
+      "/n.md",
+      "# N\n\n```js\nconst x = 1;\n```\n\n```js\nconst x = 2;\n```\n",
+    );
+    const output = new MemFilesApi();
+    const failures: NotebookFailure[][] = [];
+    await build(notebooks, output, { onFailed: (f) => failures.push(f) }).build();
+
+    expect(failures.at(-1)?.map((f) => f.notebookPath)).toEqual(["/n.md"]);
+    expect(String(failures.at(-1)?.[0]?.error)).toMatch(/"x"/);
+    expect(await output.exists("/n.html")).toBe(false);
   });
 });
