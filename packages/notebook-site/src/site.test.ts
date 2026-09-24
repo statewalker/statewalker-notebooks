@@ -2,7 +2,7 @@ import { newPubSub } from "@statewalker/notebook-events";
 import type { FilesApi } from "@statewalker/webrun-files";
 import { writeText } from "@statewalker/webrun-files";
 import { MemFilesApi } from "@statewalker/webrun-files-mem";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { newNotebookSite } from "./site.js";
 
 async function seededOutput() {
@@ -130,9 +130,16 @@ describe("newNotebookSite", () => {
     for (const path of seenPaths) expect(path.split("/")).not.toContain("..");
   });
 
-  it("does not throw for a malformed path", async () => {
+  // `resolves.toBeDefined()` asserted nothing — a `Response` is always defined, and this was
+  // the one test that stayed green under every mutation, deleting `setFiles` included.
+  // Note what this input actually is: by the time a handler sees it, it is not a traversal at
+  // all. `new URL("http://h/%2e%2e/%2e%2e/etc/passwd").pathname` is "/etc/passwd" — the URL
+  // parser resolves dot-segments, percent-encoded ones included. The surviving traversal
+  // spelling is `/..%2f..%2fetc/passwd`, which has its own test above.
+  it("answers 404 for a path the URL parser has resolved out of the site", async () => {
     const handler = newNotebookSite({ output: await seededOutput() });
-    await expect(handler(new Request("http://h/%2e%2e/%2e%2e/etc/passwd"))).resolves.toBeDefined();
+    const res = await handler(new Request("http://h/%2e%2e/%2e%2e/etc/passwd"));
+    expect(res.status).toBe(404);
   });
 
   // (4) a wasm loader may issue a Range request
@@ -241,7 +248,7 @@ describe("newNotebookSite", () => {
   // a throwing files backend, but only ours answers with this body. Deleting `setErrorHandler`
   // from site.ts leaves all the other tests green (the traversal path never throws), so this is
   // the only test that actually requires it to be wired.
-  it("answers 500 with its own body when the files backend throws", async () => {
+  it("answers 500 with its own body when the files backend throws, and logs the cause", async () => {
     const throwingOutput = {
       async stats() {
         throw new Error("boom");
@@ -250,10 +257,49 @@ describe("newNotebookSite", () => {
         throw new Error("boom");
       },
     } as never;
-    const handler = newNotebookSite({ output: throwingOutput });
-    const res = await handler(new Request("http://h/whatever.html"));
-    expect(res.status).toBe(500);
-    expect(await res.text()).toBe("internal error"); // not "Internal Server Error"
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const handler = newNotebookSite({ output: throwingOutput });
+      const res = await handler(new Request("http://h/whatever.html"));
+      expect(res.status).toBe(500);
+      expect(await res.text()).toBe("internal error"); // not "Internal Server Error"
+      // Deleting the handler's `console.error` left every other test green. A 500 whose cause
+      // is swallowed is the failure mode the handler exists to prevent, so the log is asserted.
+      expect(logged).toHaveBeenCalledWith("[notebook-site]", expect.any(Error));
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  // A KNOWN GAP, pinned here so it is known rather than assumed away. `setErrorHandler` wraps
+  // the dispatch, but `newServeFiles` returns a `Response` whose body is a `ReadableStream`
+  // that pulls from `filesApi.read` lazily: a backend that throws mid-read reaches
+  // `controller.error()` long after the handler returned. The caller gets a 200 with a
+  // truncated body, no 500 and no log — the error handler never sees it. Closing the gap means
+  // buffering the body (unacceptable) or a stream that can signal a trailer (nothing to build
+  // on yet), so it is documented, not fixed. If this test ever goes red because the request
+  // now answers 500, that is the gap closing: rewrite it, do not relax it.
+  it("does NOT convert a mid-body read failure into a 500 (documented gap)", async () => {
+    const output = {
+      async stats() {
+        return { kind: "file" as const, size: 64, lastModified: 0 };
+      },
+      async *read() {
+        yield new TextEncoder().encode("partial");
+        throw new Error("mid-read failure");
+      },
+    } as never;
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const handler = newNotebookSite({ output });
+      const res = await handler(new Request("http://h/big.csv"));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-length")).toBe("64"); // and only 7 bytes will arrive
+      await expect(res.text()).rejects.toThrow(/mid-read failure/);
+      expect(logged).not.toHaveBeenCalled();
+    } finally {
+      logged.mockRestore();
+    }
   });
 });
 
