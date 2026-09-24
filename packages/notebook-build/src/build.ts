@@ -12,15 +12,23 @@ import {
   type FilesApi,
   joinPath,
   readText,
+  tryReadFile,
   tryReadText,
   writeText,
 } from "@statewalker/webrun-files";
 import { copyAttachments } from "./assets.js";
 import { type ModuleServerLike, materializeDeps } from "./deps.js";
+import { contentHash, textHash } from "./hash.js";
 import { parseMarkdown } from "./md-parse.js";
 import { parseNotebookHtml } from "./parse.js";
 import { renderPage } from "./render.js";
-import { type PinMap, resolveNotebook, toModuleRef } from "./resolve.js";
+import {
+  type ModuleRef,
+  type ModuleResolver,
+  type PinMap,
+  resolveNotebook,
+  toModuleRef,
+} from "./resolve.js";
 import { type DomEnv, notebookHash, serializeNotebook } from "./serialize.js";
 import { transpileNotebook } from "./transpile.js";
 
@@ -46,7 +54,7 @@ const RUNTIME_SPECIFIER = "npm:@observablehq/notebook-kit/runtime";
 const DEFAULT_BASE_PATH = "/_m/";
 
 const ARTIFACT_SUFFIX = ".nb.html";
-const HASH_SUFFIX = ".hash";
+const STATE_SUFFIX = ".state.json";
 const MANIFEST_SUFFIX = ".outputs.json";
 
 /** Source extensions treated as notebooks; everything else scanned is inert (data, assets). */
@@ -99,6 +107,27 @@ interface Manifest {
   deps: string[];
 }
 
+/**
+ * Everything the rendered page depended on, recorded when — and only when — the render
+ * SUCCEEDED. The build re-derives a notebook whenever any of these disagrees with the world.
+ *
+ * The gate used to be `hash` alone, and every other input was assumed to follow the notebook's
+ * bytes. It does not: a `stylesUrl` bump left every page linking the old stylesheet, switching
+ * to static mode never materialized a closure, a republished dependency stayed pinned to its
+ * old URL, an edited attachment kept serving its old bytes, and a page deleted out of the
+ * output was never restored. All five were reproduced with the source untouched.
+ */
+interface NotebookState {
+  /** Hash of the serialized notebook that was rendered. */
+  hash: string;
+  /** Hash of the build configuration the page was rendered under. */
+  configHash: string;
+  /** The pin map the page was linked against, runtime included: specifier -> URL. */
+  pins: Record<string, string>;
+  /** Source path -> hash of the bytes published for it. */
+  attachments: Record<string, string>;
+}
+
 interface Host {
   engine: BuildEngine<Host>;
   notebooks: FilesApi;
@@ -109,11 +138,55 @@ interface Host {
   mode: "hosted" | "static";
   basePath: string;
   stylesUrl?: string;
+  logger: Logger;
+  /** Hash of the configuration above — see `NotebookState.configHash`. */
+  configHash: string;
   /** Output paths written during the current `build()`. */
   changed: Set<string>;
   failures: NotebookFailure[];
-  /** Memoized per build, so a recovered module server is picked up on the next one. */
+  /**
+   * The module server, with one resolution per specifier per build. The freshness check asks
+   * it about every recorded pin of every notebook, so without this a hundred notebooks sharing
+   * `d3` would ask a hundred times. Cleared on each `build()`, so a recovered module server and
+   * a republished dependency are both picked up on the next one.
+   */
+  resolver: ModuleResolver & { reset(): void };
+  /** Memoized per build, like every other resolution. */
   runtime?: Promise<string>;
+}
+
+/**
+ * The configuration fingerprint. `mode`, `basePath` and `stylesUrl` all end up in the rendered
+ * page or decide whether the closure is written at all, so a change to any of them must
+ * invalidate every notebook — none of them leaves a trace in a notebook's own bytes.
+ */
+function configHashOf(options: NotebookBuildOptions): Promise<string> {
+  return textHash(
+    JSON.stringify({
+      mode: options.mode ?? "static",
+      basePath: options.basePath ?? DEFAULT_BASE_PATH,
+      stylesUrl: options.stylesUrl ?? null,
+    }),
+  );
+}
+
+/** A `ModuleResolver` that resolves each specifier at most once per build. */
+function memoizingResolver(server: ModuleServerLike): ModuleResolver & { reset(): void } {
+  let pending = new Map<string, Promise<{ url: string; target: string }>>();
+  return {
+    resolve(ref: ModuleRef) {
+      const key = JSON.stringify([ref.pkg, ref.version ?? null, ref.subpath ?? null]);
+      let found = pending.get(key);
+      if (!found) {
+        found = server.resolve(ref);
+        pending.set(key, found);
+      }
+      return found;
+    },
+    reset() {
+      pending = new Map();
+    },
+  };
 }
 
 function sourcePath(uri: string): string {
@@ -149,32 +222,107 @@ async function readManifestAt(cache: FilesApi, path: string): Promise<Manifest |
   }
 }
 
+async function readStateAt(cache: FilesApi, path: string): Promise<NotebookState | undefined> {
+  const text = await tryReadText(cache, path);
+  if (text === undefined) return undefined;
+  try {
+    const raw = JSON.parse(text) as Partial<NotebookState>;
+    if (typeof raw.hash !== "string" || typeof raw.configHash !== "string") return undefined;
+    return {
+      hash: raw.hash,
+      configHash: raw.configHash,
+      pins: raw.pins ?? {},
+      attachments: raw.attachments ?? {},
+    };
+  } catch {
+    // A truncated sidecar is a cache miss, not a build failure.
+    return undefined;
+  }
+}
+
 function manifestPaths(manifest: Manifest): string[] {
   return [manifest.page, ...manifest.assets, ...manifest.deps];
 }
 
 /**
- * The gate. A notebook is skipped only when the serialized `.html` it produces is
- * byte-identical to the one last *successfully rendered* (the hash sidecar is written
- * by `[Page]`, never by `[Notebook]`) AND every output that render produced is still
- * present. Hashing the serialization rather than the source is deliberate: two
- * different Markdown inputs that serialize identically must not re-render, and an
- * mtime bump carrying identical bytes must reuse the artifact.
+ * The gate, stated as a question with an answer: why must this notebook be re-derived?
+ * `undefined` means it must not.
+ *
+ * A notebook is skipped only when the render that produced the published page SUCCEEDED (the
+ * state sidecar is written by `[Page]`, never by `[Notebook]`), under this configuration, from
+ * this serialization, against these pins and these attachment bytes — and every output that
+ * render produced is still present. Hashing the serialization rather than the source is
+ * deliberate: two different Markdown inputs that serialize identically must not re-render, and
+ * an mtime bump carrying identical bytes must reuse the artifact.
+ *
+ * `hash` is omitted by the revalidation pass, which has not parsed the notebook and only asks
+ * about the inputs that can move on their own.
  */
-async function isUpToDate(host: Host, uri: string, hash: string): Promise<boolean> {
-  if ((await tryReadText(host.cache, sidecarPath(uri, HASH_SUFFIX))) !== hash) return false;
+async function staleReason(host: Host, uri: string, hash?: string): Promise<string | undefined> {
+  const state = await readStateAt(host.cache, sidecarPath(uri, STATE_SUFFIX));
+  // No record means the last attempt never finished: a first build, or a render that threw.
+  // Either way the retry must not wait for someone to touch the source.
+  if (!state) return "it has no recorded successful build";
+  if (hash !== undefined && state.hash !== hash) return "the notebook changed";
+  if (state.configHash !== host.configHash) return "the build configuration changed";
   const manifest = await readManifestAt(host.cache, sidecarPath(uri, MANIFEST_SUFFIX));
-  if (!manifest) return false;
-  // `deps` is deliberately not probed: the closure is shared across notebooks and can
-  // run to thousands of files, and it is re-materialized whenever any notebook renders.
+  if (!manifest) return "its outputs were never recorded";
+  // `deps` is deliberately not probed: the closure is shared across notebooks and can run to
+  // thousands of files, and it is re-materialized whenever any notebook renders.
   for (const path of [manifest.page, ...manifest.assets]) {
-    if (!(await host.output.exists(path))) return false;
+    if (!(await host.output.exists(path))) return `a recorded output is missing (${path})`;
   }
-  return true;
+  for (const [path, recorded] of Object.entries(state.attachments)) {
+    const data = await tryReadFile(host.notebooks, path);
+    if (data === undefined) return `an attachment is gone (${path})`;
+    if ((await contentHash(data)) !== recorded) return `an attachment changed (${path})`;
+  }
+  for (const [specifier, url] of Object.entries(state.pins)) {
+    let resolved: string;
+    try {
+      resolved = (await host.resolver.resolve(toModuleRef(specifier))).url;
+    } catch {
+      // Unverifiable, which is not the same as changed: a module server that is momentarily
+      // unreachable must not tear down a page that works. The next reachable build re-checks.
+      continue;
+    }
+    if (resolved !== url) return `a dependency moved (${specifier} -> ${resolved})`;
+  }
+  return undefined;
+}
+
+/**
+ * Drops the recorded state of every notebook that must be re-derived, and re-drives the
+ * pipeline over the whole source set when there is at least one.
+ *
+ * This exists because the engine's scanner is the build's only trigger and it watches exactly
+ * one thing: the mtime of a source file. Everything else a page depends on — the configuration,
+ * the module server's answers, an attachment's bytes, the output tree itself — can move with no
+ * source touch at all, and `[Notebook]` would simply never run. `restartFrom` replays the known
+ * sources through a gate that now asks all of those questions, so the unaffected notebooks fall
+ * straight back out of it.
+ */
+async function revalidate(host: Host): Promise<void> {
+  let stale = false;
+  for await (const info of host.notebooks.list("/", { recursive: true })) {
+    if (info.kind !== "file") continue;
+    const path = joinPath("/", info.path);
+    // The engine's own state lives under a dot-folder in this same tree; so does `.git`.
+    if (path.split("/").some((segment) => segment.startsWith("."))) continue;
+    if (!NOTEBOOK_EXT.test(path)) continue;
+    const uri = path.slice(1);
+    const reason = await staleReason(host, uri);
+    if (reason === undefined) continue;
+    host.logger.info("notebook must be re-derived", { notebook: path, reason });
+    const statePath = sidecarPath(uri, STATE_SUFFIX);
+    if (await host.cache.exists(statePath)) await host.cache.remove(statePath);
+    stale = true;
+  }
+  if (stale) await host.engine.restartFrom(NOTEBOOK_CELL);
 }
 
 function runtimeUrlOf(host: Host): Promise<string> {
-  host.runtime ??= host.moduleServer
+  host.runtime ??= host.resolver
     .resolve(toModuleRef(RUNTIME_SPECIFIER))
     .then((resolved) => resolved.url);
   return host.runtime;
@@ -192,20 +340,26 @@ function runtimeUrlOf(host: Host): Promise<string> {
  *    `listResources`, say) leaves the page and its attachments in `output` with
  *    nothing recording them: a later deletion cannot prune what no manifest mentions,
  *    and the output grows for ever.
- * 2. The HASH sidecar is written last, and never by `[Notebook]`. It is the record
- *    "this exact serialization was successfully rendered". Recording it at
- *    serialization time makes an edit that failed to render look already-built, so a
- *    retry with the same bytes is skipped and the previous version serves for ever.
+ * 2. The STATE sidecar is written last, and never by `[Notebook]`. It is the record
+ *    "this exact serialization was successfully rendered, under this configuration,
+ *    against these pins and these attachment bytes". Recording it at serialization time
+ *    makes an edit that failed to render look already-built, so a retry with the same bytes
+ *    is skipped and the previous version serves for ever.
  *
  * Everything that throws for a notebook-specific reason (`resolveNotebook`,
  * `copyAttachments`) still runs before anything is written at all.
+ *
+ * The freshness gate is asked again here, not only in `[Notebook]`: `restartFrom` replays
+ * every past `notebook` update through this stage, and re-rendering a page that nothing has
+ * invalidated would undo the incrementality the whole pipeline exists for.
  */
 async function emitPage(host: Host, uri: string): Promise<void> {
   const notebookPath = sourcePath(uri);
   const serialized = await readText(host.cache, sidecarPath(uri, ARTIFACT_SUFFIX));
+  if ((await staleReason(host, uri, await notebookHash(serialized))) === undefined) return;
   const nb = parseNotebookHtml(serialized, host.dom);
 
-  const pins = await resolveNotebook(nb, { moduleServer: host.moduleServer }, notebookPath);
+  const pins = await resolveNotebook(nb, { moduleServer: host.resolver }, notebookPath);
   const runtimeUrl = await runtimeUrlOf(host);
   const page = renderPage(nb, transpileNotebook(nb, pins), {
     runtimeUrl,
@@ -215,24 +369,44 @@ async function emitPage(host: Host, uri: string): Promise<void> {
 
   const pagePathOf = pagePath(uri);
   await writeText(host.output, pagePathOf, page);
-  await writeManifest(host, uri, { page: pagePathOf, assets, deps: [] });
+  await writeManifest(host, uri, {
+    page: pagePathOf,
+    assets: assets.map((a) => a.path),
+    deps: [],
+  });
 
+  let deps: string[] = [];
   if (host.mode === "static") {
-    const deps = await materializeDeps(
+    deps = await materializeDeps(
       new Map([...pins, [RUNTIME_SPECIFIER, runtimeUrl]]) as PinMap,
       host.moduleServer,
       host.output,
       host.basePath,
     );
-    await writeManifest(host, uri, { page: pagePathOf, assets, deps });
+    await writeManifest(host, uri, {
+      page: pagePathOf,
+      assets: assets.map((a) => a.path),
+      deps,
+    });
   }
 
-  await writeText(host.cache, sidecarPath(uri, HASH_SUFFIX), await notebookHash(serialized));
-  for (const path of [pagePathOf, ...assets]) host.changed.add(path);
+  await writeState(host, uri, {
+    hash: await notebookHash(serialized),
+    configHash: host.configHash,
+    pins: Object.fromEntries([...pins, [RUNTIME_SPECIFIER, runtimeUrl]]),
+    attachments: Object.fromEntries(assets.map((a) => [a.path, a.hash])),
+  });
+  // The closure is part of what changed: a deploy driven off `changed` that uploads the page
+  // and none of its dependencies publishes a site whose every module 404s.
+  for (const path of [pagePathOf, ...assets.map((a) => a.path), ...deps]) host.changed.add(path);
 }
 
 function writeManifest(host: Host, uri: string, manifest: Manifest): Promise<void> {
   return writeText(host.cache, sidecarPath(uri, MANIFEST_SUFFIX), JSON.stringify(manifest));
+}
+
+function writeState(host: Host, uri: string, state: NotebookState): Promise<void> {
+  return writeText(host.cache, sidecarPath(uri, STATE_SUFFIX), JSON.stringify(state));
 }
 
 /**
@@ -265,7 +439,7 @@ async function pruneNotebook(host: Host, uri: string): Promise<void> {
       if (await host.output.exists(path)) await host.output.remove(path);
     }
   }
-  for (const suffix of [ARTIFACT_SUFFIX, HASH_SUFFIX, MANIFEST_SUFFIX]) {
+  for (const suffix of [ARTIFACT_SUFFIX, STATE_SUFFIX, MANIFEST_SUFFIX]) {
     const path = sidecarPath(uri, suffix);
     if (await host.cache.exists(path)) await host.cache.remove(path);
   }
@@ -295,14 +469,22 @@ function notebookBuilders(): RegisteredBuilder<Host>[] {
           signal: SOURCES_SIGNAL,
           cell: NOTEBOOK_CELL,
         })) {
-          if (NOTEBOOK_EXT.test(update.uri)) {
+          // A `sources` entry outlives the file: the scanner emits `sources-removed` on a
+          // deletion but leaves the old `sources` entry in the store, and `restartFrom` replays
+          // it. Reading it back would report a deleted notebook as a build failure, for ever.
+          if (
+            NOTEBOOK_EXT.test(update.uri) &&
+            (await host.notebooks.exists(sourcePath(update.uri)))
+          ) {
             try {
               const text = await readText(host.notebooks, sourcePath(update.uri));
               const serialized = serializeNotebook(
                 parseSource(text, update.uri, host.dom),
                 host.dom,
               );
-              if (!(await isUpToDate(host, update.uri, await notebookHash(serialized)))) {
+              if (
+                (await staleReason(host, update.uri, await notebookHash(serialized))) !== undefined
+              ) {
                 await writeText(host.cache, sidecarPath(update.uri, ARTIFACT_SUFFIX), serialized);
                 yield { signal: NOTEBOOK_SIGNAL, uri: update.uri, stamp: update.stamp };
               }
@@ -381,6 +563,9 @@ export function newNotebookBuild(options: NotebookBuildOptions): NotebookBuild {
     mode: options.mode ?? "static",
     basePath: options.basePath ?? DEFAULT_BASE_PATH,
     ...(options.stylesUrl === undefined ? {} : { stylesUrl: options.stylesUrl }),
+    logger,
+    configHash: "",
+    resolver: memoizingResolver(options.moduleServer),
     changed: new Set<string>(),
     failures: [] as NotebookFailure[],
   } as Host;
@@ -399,6 +584,10 @@ export function newNotebookBuild(options: NotebookBuildOptions): NotebookBuild {
       host.changed.clear();
       host.failures.length = 0;
       host.runtime = undefined;
+      host.resolver.reset();
+      host.configHash = await configHashOf(options);
+      // Before the engine's mtime scanner gets a say: everything else the pages depend on.
+      await revalidate(host);
       for await (const _ of engine.run()) {
         // Drain progress events to convergence.
       }

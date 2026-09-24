@@ -7,6 +7,7 @@ import { MemFilesApi } from "@statewalker/webrun-files-mem";
 import { NodeFilesApi } from "@statewalker/webrun-files-node";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { copyAttachments } from "./assets.js";
+import { contentHash } from "./hash.js";
 import { parseMarkdown } from "./md-parse.js";
 
 describe("copyAttachments", () => {
@@ -16,7 +17,10 @@ describe("copyAttachments", () => {
     await writeText(source, "/nb/data.csv", "a,b\n1,2\n");
     const nb = parseMarkdown('# T\n\n```js\nconst d = FileAttachment("data.csv");\n```\n');
     const written = await copyAttachments(nb, source, output, "/nb/index.md");
-    expect(written).toEqual(["/nb/data.csv"]);
+    expect(written.map((a) => a.path)).toEqual(["/nb/data.csv"]);
+    // The recorded hash is the hash of the bytes that were copied, not of the name or the
+    // path: the incremental gate compares it against the attachment's current content.
+    expect(written[0]?.hash).toBe(await contentHash(new TextEncoder().encode("a,b\n1,2\n")));
     expect(await output.exists("/nb/data.csv")).toBe(true);
   });
 
@@ -43,7 +47,9 @@ describe("copyAttachments", () => {
     const nb = parseMarkdown(
       '# T\n\n```js\nFileAttachment("d.csv");\n```\n\n```js\nFileAttachment("d.csv");\n```\n',
     );
-    expect(await copyAttachments(nb, source, output, "/n.md")).toEqual(["/d.csv"]);
+    expect((await copyAttachments(nb, source, output, "/n.md")).map((a) => a.path)).toEqual([
+      "/d.csv",
+    ]);
   });
 });
 
@@ -107,7 +113,9 @@ describe("copyAttachments — path containment", () => {
     await writeText(source, "/nb/data.csv", "a\n");
     const nb = parseMarkdown('# T\n\n```js\nFileAttachment("sub/../data.csv");\n```\n');
     // Left unresolved this is the key `/nb/sub/../data.csv`, which exists nowhere.
-    expect(await copyAttachments(nb, source, output, "/nb/index.md")).toEqual(["/nb/data.csv"]);
+    expect((await copyAttachments(nb, source, output, "/nb/index.md")).map((a) => a.path)).toEqual([
+      "/nb/data.csv",
+    ]);
     expect(await output.exists("/nb/data.csv")).toBe(true);
   });
 });

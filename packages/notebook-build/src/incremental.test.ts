@@ -70,19 +70,24 @@ const build = (
   notebooks: FilesApi,
   output: FilesApi,
   extra: {
+    cache?: FilesApi;
     moduleServer?: ModuleServerLike;
     onFailed?: (f: NotebookFailure[]) => void;
+    onRebuilt?: (changed: string[]) => void;
     mode?: "hosted" | "static";
+    stylesUrl?: string;
   } = {},
 ) =>
   newNotebookBuild({
     notebooks,
     output,
-    cache: new MemFilesApi(),
+    cache: extra.cache ?? new MemFilesApi(),
     moduleServer: extra.moduleServer ?? fakeServer(),
     dom: nodeDom(),
     mode: extra.mode ?? "hosted",
     ...(extra.onFailed ? { onFailed: extra.onFailed } : {}),
+    ...(extra.onRebuilt ? { onRebuilt: extra.onRebuilt } : {}),
+    ...(extra.stylesUrl ? { stylesUrl: extra.stylesUrl } : {}),
   });
 
 describe("newNotebookBuild — incremental", () => {
@@ -320,5 +325,167 @@ describe("newNotebookBuild — incremental", () => {
     expect(await output.exists("/n.html")).toBe(false);
     expect(await output.exists("/_m/d3@1/index.js")).toBe(false);
     expect(await output.exists("/_m/@observablehq/notebook-kit@1/index.js")).toBe(false);
+  });
+});
+
+/**
+ * The gate used to key on the notebook's bytes and nothing else, and it treated that single
+ * trigger as sufficient for every input the output actually depends on. Each case below was
+ * reproduced against the old build: the source is never touched, and the page is wrong.
+ */
+describe("newNotebookBuild — what invalidates a built page", () => {
+  it("re-renders every notebook when the stylesheet URL changes", async () => {
+    const notebooks = await seed();
+    const output = new MemFilesApi();
+    const cache = new MemFilesApi();
+    await build(notebooks, output, { cache, stylesUrl: "/v1.css" }).build();
+    expect(await readText(output, "/a.html")).toContain('href="/v1.css"');
+
+    await build(notebooks, output, { cache, stylesUrl: "/v2.css" }).build();
+    expect(await readText(output, "/a.html")).toContain('href="/v2.css"');
+    expect(await readText(output, "/b.html")).toContain('href="/v2.css"');
+  });
+
+  it("materializes the closure when the mode changes from hosted to static", async () => {
+    const notebooks = new MemFilesApi();
+    await writeText(notebooks, "/n.md", '# N\n\n```js\nimport * as d3 from "d3";\n```\n');
+    const output = new MemFilesApi();
+    const cache = new MemFilesApi();
+    const server: ModuleServerLike = {
+      ...fakeServer(),
+      listResources: async (ref: ModuleRef) => [`/_m/${ref.pkg}@1/index.js`],
+      fetch: async () => new Response("//module\n", { status: 200 }),
+    };
+    await build(notebooks, output, { cache, moduleServer: server, mode: "hosted" }).build();
+    expect(await output.exists("/_m/d3@1/index.js")).toBe(false);
+
+    await build(notebooks, output, { cache, moduleServer: server, mode: "static" }).build();
+    expect(await output.exists("/_m/d3@1/index.js")).toBe(true);
+  });
+
+  it("re-pins a dependency that the server now resolves elsewhere", async () => {
+    const notebooks = new MemFilesApi();
+    await writeText(notebooks, "/n.md", '# N\n\n```js\nimport * as d3 from "d3";\n```\n');
+    const output = new MemFilesApi();
+    let version = 1;
+    const server: ModuleServerLike = {
+      ...fakeServer(),
+      resolve: async (ref: ModuleRef) => ({
+        url: `/_m/${ref.pkg}@${version}/index.js`,
+        target: "browser",
+      }),
+    };
+    const b = build(notebooks, output, { moduleServer: server });
+    await b.build();
+    expect(await readText(output, "/n.html")).toContain("/_m/d3@1/index.js");
+
+    // The dependency was republished; the notebook's own bytes did not move.
+    version = 2;
+    await b.build();
+    expect(await readText(output, "/n.html")).toContain("/_m/d3@2/index.js");
+    expect(await readText(output, "/n.html")).not.toContain("/_m/d3@1/index.js");
+  });
+
+  it("re-copies an attachment whose content changed", async () => {
+    const notebooks = new MemFilesApi();
+    const output = new MemFilesApi();
+    await writeText(notebooks, "/n.md", '# N\n\n```js\nFileAttachment("d.csv");\n```\n');
+    await writeText(notebooks, "/d.csv", "v1\n");
+    const b = build(notebooks, output);
+    await b.build();
+    expect(await readText(output, "/d.csv")).toBe("v1\n");
+
+    await tick();
+    await writeText(notebooks, "/d.csv", "v2\n");
+    await b.build();
+    expect(await readText(output, "/d.csv")).toBe("v2\n");
+  });
+
+  it("restores an output that was deleted from the output tree", async () => {
+    const notebooks = await seed();
+    const output = new MemFilesApi();
+    const b = build(notebooks, output);
+    await b.build();
+
+    await output.remove("/a.html");
+    await b.build();
+    expect(await output.exists("/a.html")).toBe(true);
+    expect(await readText(output, "/a.html")).toContain('"outputs":["x"]');
+  });
+
+  it("retries a notebook that failed transiently, with no source touch", async () => {
+    const notebooks = new MemFilesApi();
+    await writeText(notebooks, "/n.md", '# N\n\n```js\nimport x from "npm:flaky";\n```\n');
+    const output = new MemFilesApi();
+    let broken = true;
+    const server: ModuleServerLike = {
+      ...fakeServer(),
+      resolve: async (ref: ModuleRef) => {
+        if (broken) throw new Error("registry down");
+        return { url: `/_m/${ref.pkg}@1/index.js`, target: "browser" };
+      },
+    };
+    const failures: NotebookFailure[][] = [];
+    const changed: string[][] = [];
+    const b = build(notebooks, output, {
+      moduleServer: server,
+      onFailed: (f) => failures.push(f),
+      onRebuilt: (c) => changed.push(c),
+    });
+    await b.build();
+    expect(await output.exists("/n.html")).toBe(false);
+
+    // The operator re-runs the build after the registry recovers. Nothing in the sources
+    // moved — and the old build reported `failures: []`, `changed: []` and no page, so a CI
+    // gate on `onFailed` would have shipped a site with a missing page.
+    broken = false;
+    await b.build();
+    expect(await output.exists("/n.html")).toBe(true);
+    expect(failures.at(-1)).toHaveLength(1);
+    expect(changed.at(-1)).toContain("/n.html");
+  });
+
+  it("retries a notebook whose closure failed to materialize, with no source touch", async () => {
+    const notebooks = new MemFilesApi();
+    await writeText(notebooks, "/n.md", '# N\n\n```js\nimport * as d3 from "d3";\n```\n');
+    const output = new MemFilesApi();
+    let broken = true;
+    const server: ModuleServerLike = {
+      ...fakeServer(),
+      listResources: async (ref: ModuleRef) => {
+        if (broken) throw new Error("closure unavailable");
+        return [`/_m/${ref.pkg}@1/index.js`];
+      },
+      fetch: async () => new Response("//module\n", { status: 200 }),
+    };
+    const b = build(notebooks, output, { moduleServer: server, mode: "static" });
+    await b.build();
+    // In static mode the page is written before the closure, so the site exists and is dead.
+    expect(await output.exists("/n.html")).toBe(true);
+    expect(await output.exists("/_m/d3@1/index.js")).toBe(false);
+
+    broken = false;
+    await b.build();
+    expect(await output.exists("/_m/d3@1/index.js")).toBe(true);
+  });
+
+  it("reports the materialized closure among the changed paths", async () => {
+    const notebooks = new MemFilesApi();
+    await writeText(notebooks, "/n.md", '# N\n\n```js\nimport * as d3 from "d3";\n```\n');
+    const output = new MemFilesApi();
+    const server: ModuleServerLike = {
+      ...fakeServer(),
+      listResources: async (ref: ModuleRef) => [`/_m/${ref.pkg}@1/index.js`],
+      fetch: async () => new Response("//module\n", { status: 200 }),
+    };
+    const changed: string[][] = [];
+    await build(notebooks, output, {
+      moduleServer: server,
+      mode: "static",
+      onRebuilt: (c) => changed.push(c),
+    }).build();
+    // A deploy driven off `changed` uploads the page and none of its dependencies otherwise.
+    expect(changed.at(-1)).toContain("/n.html");
+    expect(changed.at(-1)).toContain("/_m/d3@1/index.js");
   });
 });

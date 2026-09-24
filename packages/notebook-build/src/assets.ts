@@ -1,6 +1,14 @@
 import { type Notebook, transpile } from "@observablehq/notebook-kit";
 import { dirname, type FilesApi, readFile } from "@statewalker/webrun-files";
+import { contentHash } from "./hash.js";
 import { resolveWithin } from "./paths.js";
+
+/** One copied attachment: where it landed, and the hash of the bytes that were copied. */
+export interface CopiedAttachment {
+  path: string;
+  /** Hex SHA-256 of the copied content — the build's record of WHICH bytes are published. */
+  hash: string;
+}
 
 const CODE_MODES = new Set(["js", "ts", "ojs"]);
 
@@ -38,18 +46,21 @@ function collectAttachmentNames(nb: Notebook): string[] {
  * benign-looking case is broken too — a browser resolves `../../shared/x.csv` against the
  * PAGE's URL, so it asks for a path this build never writes.
  *
- * Returns the output paths written. That list is load-bearing: a later prune step
- * removes exactly these paths when the notebook that referenced them disappears, so
- * this must report every path it actually wrote, not just the notebook's own page.
+ * Returns the output paths written, each with the hash of the bytes written there. Both
+ * halves are load-bearing: a later prune step removes exactly these paths when the notebook
+ * that referenced them disappears, and the incremental gate compares the recorded hash against
+ * the attachment's current content, so an edited attachment republishes. Hashing what was
+ * copied — rather than re-reading afterwards — is what makes the record describe the bytes
+ * that are actually in the output.
  */
 export async function copyAttachments(
   nb: Notebook,
   source: FilesApi,
   output: FilesApi,
   notebookPath: string,
-): Promise<string[]> {
+): Promise<CopiedAttachment[]> {
   const dir = dirname(notebookPath);
-  const written: string[] = [];
+  const written: CopiedAttachment[] = [];
   for (const name of collectAttachmentNames(nb)) {
     const path = resolveWithin(dir, name);
     if (path === undefined) {
@@ -62,7 +73,7 @@ export async function copyAttachments(
     }
     const data = await readFile(source, path);
     await output.write(path, [data]);
-    written.push(path);
+    written.push({ path, hash: await contentHash(data) });
   }
   return written;
 }

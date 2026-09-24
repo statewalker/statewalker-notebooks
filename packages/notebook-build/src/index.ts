@@ -1,4 +1,4 @@
-export { copyAttachments } from "./assets.js";
+export { type CopiedAttachment, copyAttachments } from "./assets.js";
 export {
   type NotebookBuild,
   type NotebookBuildOptions,
@@ -6,8 +6,10 @@ export {
   newNotebookBuild,
 } from "./build.js";
 export { ASSET_EXTENSIONS, type ModuleServerLike, materializeDeps } from "./deps.js";
+export { contentHash, textHash } from "./hash.js";
 export { parseMarkdown } from "./md-parse.js";
 export { parseNotebookHtml } from "./parse.js";
+export { resolveWithin } from "./paths.js";
 export { type RenderOptions, renderPage } from "./render.js";
 export {
   collectSpecifiers,
