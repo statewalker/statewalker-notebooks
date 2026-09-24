@@ -73,6 +73,16 @@ HTML source can carry them — a Markdown fence has no syntax for an attribute.
   a notebook at `/reports/q3.html` reads `/reports/.observable/cache/…`. Writing those files is
   `@statewalker/notebook-db`'s `precomputeQueries`.
 
+A Markdown ` ```sql ` fence is therefore a cell with NEITHER attribute, and since `ca27d82`
+that is a live cell, not prose: it compiles to ``DatabaseClient.of(db, "db").sql`…` `` against
+the notebook's own `db` variable (the `database` default), and with no `output` it is
+anonymous — it runs and displays its result, and nothing downstream can name its rows. A
+notebook that wants to reference the rows, or to query anything other than `db`, needs a
+notebook-kit HTML source. Measured against notebook-kit 2.6.4, a bare `sql` cell transpiles to
+`inputs: ["DatabaseClient", "db"]`, `outputs: []`, no singular `output` and `autodisplay:
+true` — a consumer of a `db` variable the notebook must define elsewhere, and a producer of
+nothing.
+
 `output="revenue"` exposes the cell's rows to the rest of the notebook. It is notebook-kit's
 *singular* output — `outputs` stays empty for a SQL cell — and two cells claiming one name fail
 the build exactly as two `const x` cells do.
@@ -97,11 +107,20 @@ left inert because the body cannot run in a page this build produces.
 For `/reports/q3.md`:
 
 - `/reports/q3.html` — the page: one root element per cell, one `define()` per code cell.
-- every `FileAttachment("…")` it references, copied to the same relative path. An attachment
-  that resolves outside the notebook's own directory is refused.
-- in static mode, the dependency closure under `basePath`: every JS-reachable module plus the
-  `.wasm`, `.css` and font files a package ships that its JS graph never imports (a static
-  export built from the JS graph alone looks perfect and dies at the first wasm instantiation).
+- every `FileAttachment("…")` it references, copied to the same relative path — including one
+  inside a `sql` cell's `${…}` interpolation, which notebook-kit compiles as JavaScript like
+  any other cell's. An attachment that resolves outside the notebook's own directory is
+  refused.
+- in static mode, the dependency closure under `basePath`: every JS-reachable module, plus two
+  kinds of file the JS graph never imports and a closure built from it alone would therefore
+  miss (such an export looks perfect and dies at the first wasm instantiation):
+  - the `.wasm`, `.css` and font files a package ships;
+  - the classic worker scripts it ships (`*.worker.js`, and not their `.map` siblings). These
+    are fetched with `?raw` so the module server's CJS→ESM transform cannot wrap them —
+    duckdb-wasm's worker bundles are UMD, and a classic worker cannot parse the `import`/
+    `export` a wrapped one would contain. The `?raw` is on the fetch only: the file is written
+    at its plain `.worker.js` path, so the site serves it with a JavaScript content type, which
+    is what the spec requires of a classic worker script.
 
 Deleting a notebook prunes exactly what it published, minus anything another notebook still
 claims.
@@ -121,3 +140,11 @@ reported as failures rather than one silently overwriting the other.
 
 `html`, `tex`, `dot`, `sql.view`, `node`, `python` and `r` cells parse and render as inert
 prose — see "Cell modes" above for why each one is left out rather than wired up.
+
+This package has NO build-time database wiring of any kind — not a stub, not a placeholder.
+`NotebookBuildOptions` has no `databases` option, and nothing here derives a
+`PrecomputeRequest` from a parsed notebook, so a `database="warehouse"` cell's
+`.observable/cache/…json` is never written by this build. `@statewalker/notebook-db` exports
+`precomputeQueries`, which writes exactly those files, but a caller must assemble the requests
+and run it itself. Only the live path (`database="var:db"`, the Markdown fence default) works
+end to end from a build alone.
