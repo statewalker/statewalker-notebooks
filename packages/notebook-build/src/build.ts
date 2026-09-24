@@ -144,6 +144,13 @@ interface Host {
   configHash: string;
   /** Memoized: the three roots are probed once per `NotebookBuild`, not once per build. */
   rootsChecked?: Promise<void>;
+  /**
+   * `output.exists` memo for the current build. The freshness check probes every output every
+   * notebook claims, and the dependency closure is SHARED: without this, fifty notebooks over a
+   * two-thousand-file closure would be a hundred thousand stat calls per build instead of two
+   * thousand. Kept honest by recording what this build writes and removes.
+   */
+  outputProbe: Map<string, Promise<boolean>>;
   /** Output paths written during the current `build()`. */
   changed: Set<string>;
   failures: NotebookFailure[];
@@ -213,6 +220,34 @@ async function assertDistinctRoots(host: Host): Promise<void> {
       if (await files.exists(probe)) await files.remove(probe);
     }
   }
+}
+
+/**
+ * Record a failed notebook, once per build.
+ *
+ * One notebook can reach a stage twice in a single build — the revalidation replay and the
+ * scanner's own update for the same source are two updates with two stamps — and `onFailed`
+ * is a report of WHICH notebooks failed, so the same path twice is noise a CI gate would
+ * double-count. The first error is the one kept: the second is the same cause seen again.
+ */
+function recordFailure(host: Host, notebookPath: string, error: unknown): void {
+  if (host.failures.some((failure) => failure.notebookPath === notebookPath)) return;
+  host.failures.push({ notebookPath, error });
+}
+
+/** `output.exists`, asked at most once per path per build. See `Host.outputProbe`. */
+function outputHas(host: Host, path: string): Promise<boolean> {
+  let found = host.outputProbe.get(path);
+  if (!found) {
+    found = host.output.exists(path);
+    host.outputProbe.set(path, found);
+  }
+  return found;
+}
+
+/** Record what this build just wrote or removed, so the memo does not go stale mid-build. */
+function markOutput(host: Host, paths: Iterable<string>, present: boolean): void {
+  for (const path of paths) host.outputProbe.set(path, Promise.resolve(present));
 }
 
 /** A `ModuleResolver` that resolves each specifier at most once per build. */
@@ -336,10 +371,12 @@ async function staleReason(host: Host, uri: string, hash?: string): Promise<stri
   if (state.configHash !== host.configHash) return "the build configuration changed";
   const manifest = await readManifestAt(host.cache, sidecarPath(uri, MANIFEST_SUFFIX));
   if (!manifest) return "its outputs were never recorded";
-  // `deps` is deliberately not probed: the closure is shared across notebooks and can run to
-  // thousands of files, and it is re-materialized whenever any notebook renders.
-  for (const path of [manifest.page, ...manifest.assets]) {
-    if (!(await host.output.exists(path))) return `a recorded output is missing (${path})`;
+  // Every recorded output, the dependency closure included. Leaving `deps` out made a
+  // partially wiped or partially deployed `basePath` a green no-op build and a dead static
+  // site — the same defect as a deleted page, one output class over. The closure is shared and
+  // can run to thousands of files, which is what `Host.outputProbe` is for.
+  for (const path of manifestPaths(manifest)) {
+    if (!(await outputHas(host, path))) return `a recorded output is missing (${path})`;
   }
   for (const [path, recorded] of Object.entries(state.attachments)) {
     const data = await tryReadFile(host.notebooks, path);
@@ -432,7 +469,17 @@ function runtimeUrlOf(host: Host): Promise<string> {
  */
 async function emitPage(host: Host, uri: string): Promise<void> {
   const notebookPath = sourcePath(uri);
-  const serialized = await readText(host.cache, sidecarPath(uri, ARTIFACT_SUFFIX));
+  const artifactPath = sidecarPath(uri, ARTIFACT_SUFFIX);
+  const serialized = await tryReadText(host.cache, artifactPath);
+  // `readText` returns "" for a file that is not there rather than throwing, and
+  // `parseNotebookHtml("")` is a perfectly good empty notebook — so a missing artifact used to
+  // become a blank `Untitled` page published over a real URL, with no failure reported. An
+  // empty artifact is never a valid notebook; say so instead of rendering it.
+  if (serialized === undefined || serialized.trim() === "") {
+    throw new Error(
+      `${notebookPath}: the serialized notebook artifact at ${artifactPath} is missing or empty`,
+    );
+  }
   if ((await staleReason(host, uri, await notebookHash(serialized))) === undefined) return;
   const nb = parseNotebookHtml(serialized, host.dom);
 
@@ -477,7 +524,9 @@ async function emitPage(host: Host, uri: string): Promise<void> {
   });
   // The closure is part of what changed: a deploy driven off `changed` that uploads the page
   // and none of its dependencies publishes a site whose every module 404s.
-  for (const path of [pagePathOf, ...assets.map((a) => a.path), ...deps]) host.changed.add(path);
+  const written = [pagePathOf, ...assets.map((a) => a.path), ...deps];
+  markOutput(host, written, true);
+  for (const path of written) host.changed.add(path);
 }
 
 /**
@@ -537,7 +586,8 @@ async function pruneNotebook(host: Host, uri: string): Promise<void> {
     const kept = await pathsClaimedByOthers(host, uri);
     for (const path of manifestPaths(manifest)) {
       if (kept.has(path)) continue;
-      if (await host.output.exists(path)) await host.output.remove(path);
+      if (await outputHas(host, path)) await host.output.remove(path);
+      markOutput(host, [path], false);
     }
   }
   for (const suffix of [ARTIFACT_SUFFIX, STATE_SUFFIX, MANIFEST_SUFFIX]) {
@@ -598,7 +648,7 @@ function notebookBuilders(): RegisteredBuilder<Host>[] {
                 yield { signal: NOTEBOOK_SIGNAL, uri: update.uri, stamp: update.stamp };
               }
             } catch (error) {
-              host.failures.push({ notebookPath: sourcePath(update.uri), error });
+              recordFailure(host, sourcePath(update.uri), error);
             }
           }
           await update.handled();
@@ -618,9 +668,17 @@ function notebookBuilders(): RegisteredBuilder<Host>[] {
           cell: PAGE_CELL,
         })) {
           try {
-            await emitPage(host, update.uri);
+            // A `notebook` update outlives the notebook. `restartFrom` clears the handled
+            // markers of the whole downstream closure, so this stage replays the update of a
+            // source that has since been deleted — and whose `sources-removed` tombstone was
+            // consumed builds ago, so no prune will ever undo what gets written here. Without
+            // this guard an ordinary third build resurrected every deleted notebook as a blank
+            // page, permanently, and reported no failure.
+            if (await host.notebooks.exists(sourcePath(update.uri))) {
+              await emitPage(host, update.uri);
+            }
           } catch (error) {
-            host.failures.push({ notebookPath: sourcePath(update.uri), error });
+            recordFailure(host, sourcePath(update.uri), error);
           }
           await update.handled();
           if (!(await host.engine.yieldControl())) return false;
@@ -641,7 +699,7 @@ function notebookBuilders(): RegisteredBuilder<Host>[] {
           try {
             await pruneNotebook(host, update.uri);
           } catch (error) {
-            host.failures.push({ notebookPath: sourcePath(update.uri), error });
+            recordFailure(host, sourcePath(update.uri), error);
           }
           await update.handled();
           if (!(await host.engine.yieldControl())) return false;
@@ -675,6 +733,7 @@ export function newNotebookBuild(options: NotebookBuildOptions): NotebookBuild {
     logger,
     configHash: "",
     resolver: memoizingResolver(options.moduleServer),
+    outputProbe: new Map<string, Promise<boolean>>(),
     changed: new Set<string>(),
     failures: [] as NotebookFailure[],
   } as Host;
@@ -694,6 +753,7 @@ export function newNotebookBuild(options: NotebookBuildOptions): NotebookBuild {
       host.failures.length = 0;
       host.runtime = undefined;
       host.resolver.reset();
+      host.outputProbe.clear();
       host.configHash = await configHashOf(options);
       host.rootsChecked ??= assertDistinctRoots(host);
       await host.rootsChecked;

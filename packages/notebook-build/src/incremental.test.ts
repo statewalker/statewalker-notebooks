@@ -605,3 +605,126 @@ describe("newNotebookBuild — the successful-render record is written last", ()
     expect(await output.exists("/_m/plot@1/index.js")).toBe(true);
   });
 });
+
+/**
+ * `restartFrom(NOTEBOOK_CELL)` clears the handled markers of the whole downstream closure, so
+ * `[Page]` replays the `notebook` update of a notebook that has since been deleted — and its
+ * `sources-removed` tombstone was consumed builds ago, so no prune will ever undo it again.
+ *
+ * Two builds cannot reach this: the resurrection needs a THIRD build, one where something
+ * unrelated makes `revalidate` restart the pipeline. The triggers are ordinary — a new
+ * notebook, an edited attachment, any configuration change, or any notebook currently failing.
+ */
+describe("newNotebookBuild — a deleted notebook stays deleted", () => {
+  it("does not resurrect a pruned notebook when a later build revalidates", async () => {
+    const notebooks = await seed();
+    const output = new MemFilesApi();
+    const failures: NotebookFailure[][] = [];
+    const b = build(notebooks, output, { onFailed: (f) => failures.push(f) });
+    await b.build();
+    expect(await output.exists("/b.html")).toBe(true);
+
+    await tick();
+    await notebooks.remove("/b.md");
+    await b.build();
+    expect(await output.exists("/b.html")).toBe(false);
+
+    // Build three. Nothing about /b.md is involved: a brand-new notebook is what makes
+    // `revalidate` restart the pipeline.
+    await tick();
+    await writeText(notebooks, "/c.md", "# C\n\n```js\nconst z = 3;\n```\n");
+    await b.build();
+
+    expect(await output.exists("/c.html")).toBe(true);
+    expect(await output.exists("/b.html")).toBe(false);
+    expect(failures.at(-1) ?? []).toEqual([]);
+  });
+
+  it("does not resurrect a pruned notebook when a failing one keeps revalidating", async () => {
+    const notebooks = new MemFilesApi();
+    await writeText(notebooks, "/keep.md", '# Keep\n\n```js\nimport x from "npm:flaky";\n```\n');
+    await writeText(notebooks, "/gone.md", "# Gone\n\n```js\nconst y = 2;\n```\n");
+    const output = new MemFilesApi();
+    const server: ModuleServerLike = {
+      ...fakeServer(),
+      resolve: async (ref: ModuleRef) => {
+        if (ref.pkg === "flaky") throw new Error("registry down");
+        return { url: `/_m/${ref.pkg}@1/index.js`, target: "browser" };
+      },
+    };
+    const b = build(notebooks, output, { moduleServer: server, onFailed: () => {} });
+    await b.build();
+    expect(await output.exists("/gone.html")).toBe(true);
+
+    await tick();
+    await notebooks.remove("/gone.md");
+    await b.build();
+    expect(await output.exists("/gone.html")).toBe(false);
+
+    // `/keep.md` fails on every build, so every build revalidates — and every build used to
+    // put `/gone.html` back.
+    await b.build();
+    await b.build();
+    expect(await output.exists("/gone.html")).toBe(false);
+  });
+
+  it("fails loudly instead of publishing a blank page when the artifact reads empty", async () => {
+    const notebooks = new MemFilesApi();
+    await writeText(notebooks, "/n.md", "# V1\n\n```js\nconst x = 1;\n```\n");
+    const output = new MemFilesApi();
+    const store = new MemFilesApi();
+    let emptied = false;
+    // `readText` returns "" for a file that is not there — it does not throw. That silent
+    // conversion is what turned a pruned artifact into an empty, `Untitled` notebook.
+    const cache: FilesApi = {
+      read: (path: string, options?: ReadOptions) =>
+        emptied && path.endsWith(".nb.html")
+          ? (async function* () {})()
+          : store.read(path, options),
+      write: (path: string, content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>) =>
+        store.write(path, content),
+      mkdir: (path: string) => store.mkdir(path),
+      list: (path: string, options?: ListOptions) => store.list(path, options),
+      stats: (path: string) => store.stats(path),
+      exists: (path: string) => store.exists(path),
+      remove: (path: string) => store.remove(path),
+      move: (from: string, to: string) => store.move(from, to),
+      copy: (from: string, to: string) => store.copy(from, to),
+    };
+    const failures: NotebookFailure[][] = [];
+    const b = build(notebooks, output, { cache, onFailed: (f) => failures.push(f) });
+    await b.build();
+    expect(await readText(output, "/n.html")).toContain("V1");
+
+    emptied = true;
+    await tick();
+    await writeText(notebooks, "/n.md", "# V2\n\n```js\nconst x = 1;\n```\n");
+    await b.build();
+
+    expect(failures.at(-1)?.map((f) => f.notebookPath)).toEqual(["/n.md"]);
+    expect(String(failures.at(-1)?.[0]?.error)).toMatch(/empty|artifact/i);
+    // V1 keeps serving: what must never happen is a blank `Untitled` page replacing it.
+    expect(await readText(output, "/n.html")).toContain("V1");
+    expect(await readText(output, "/n.html")).not.toContain("Untitled");
+  });
+
+  it("restores a closure file deleted from the output tree", async () => {
+    const notebooks = new MemFilesApi();
+    await writeText(notebooks, "/n.md", '# N\n\n```js\nimport * as d3 from "d3";\n```\n');
+    const output = new MemFilesApi();
+    const server: ModuleServerLike = {
+      ...fakeServer(),
+      listResources: async (ref: ModuleRef) => [`/_m/${ref.pkg}@1/index.js`],
+      fetch: async () => new Response("//module\n", { status: 200 }),
+    };
+    const b = build(notebooks, output, { moduleServer: server, mode: "static" });
+    await b.build();
+    expect(await output.exists("/_m/d3@1/index.js")).toBe(true);
+
+    // A partially wiped or partially deployed `/_m/` is a dead static site, and it used to
+    // pass as a green no-op build — the same defect as a deleted page, one output class over.
+    await output.remove("/_m/d3@1/index.js");
+    await b.build();
+    expect(await output.exists("/_m/d3@1/index.js")).toBe(true);
+  });
+});
