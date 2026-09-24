@@ -1,5 +1,6 @@
 import { type Notebook, transpile } from "@observablehq/notebook-kit";
-import { dirname, type FilesApi, joinPath, readFile } from "@statewalker/webrun-files";
+import { dirname, type FilesApi, readFile } from "@statewalker/webrun-files";
+import { resolveWithin } from "./paths.js";
 
 const CODE_MODES = new Set(["js", "ts", "ojs"]);
 
@@ -30,6 +31,13 @@ function collectAttachmentNames(nb: Notebook): string[] {
  * resolved relative to the notebook's own directory (not the project root — a notebook
  * at `/nb/index.md` referencing `FileAttachment("data.csv")` means `/nb/data.csv`).
  *
+ * An attachment that climbs out of that directory is REFUSED, not copied. Unresolved `..`
+ * escapes both roots at once on a real backend (see `resolveWithin`): it reads a file above
+ * the notebooks root and writes it above the output root, and because the escaping path is
+ * recorded in the notebook's manifest, a later prune calls `output.remove()` on it. The
+ * benign-looking case is broken too — a browser resolves `../../shared/x.csv` against the
+ * PAGE's URL, so it asks for a path this build never writes.
+ *
  * Returns the output paths written. That list is load-bearing: a later prune step
  * removes exactly these paths when the notebook that referenced them disappears, so
  * this must report every path it actually wrote, not just the notebook's own page.
@@ -43,7 +51,12 @@ export async function copyAttachments(
   const dir = dirname(notebookPath);
   const written: string[] = [];
   for (const name of collectAttachmentNames(nb)) {
-    const path = joinPath(dir, name);
+    const path = resolveWithin(dir, name);
+    if (path === undefined) {
+      throw new Error(
+        `${notebookPath}: attachment "${name}" resolves outside the notebook's own directory (${dir})`,
+      );
+    }
     if (!(await source.exists(path))) {
       throw new Error(`${notebookPath}: cannot find attachment "${name}" (expected at ${path})`);
     }

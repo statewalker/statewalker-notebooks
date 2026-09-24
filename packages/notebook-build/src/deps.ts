@@ -1,4 +1,5 @@
 import type { FilesApi } from "@statewalker/webrun-files";
+import { resolveWithin } from "./paths.js";
 import { isNpmSpecifier, type ModuleRef, type PinMap, toModuleRef } from "./resolve.js";
 
 /**
@@ -59,6 +60,22 @@ function packageRoot(url: string, basePath: string): string {
 }
 
 /**
+ * Every URL this stage materializes is used verbatim as an OUTPUT PATH, and `..` in one walks
+ * out of the output root on any backend that maps paths onto a real filesystem. `listResources`
+ * is answered by the module server; `listPackageFiles` is answered by whatever the package's
+ * tarball happens to contain, which no one in this pipeline controls. Both are confined to the
+ * root they are supposed to live under, and a URL that does not stay there is a hard error
+ * rather than a skipped file — a silently dropped module is a 404 much later.
+ */
+function containedUrl(root: string, relative: string, what: string): string {
+  const url = resolveWithin(root, relative);
+  if (url === undefined) {
+    throw new Error(`cannot materialize ${what} "${relative}": it resolves outside "${root}"`);
+  }
+  return url;
+}
+
+/**
  * Materializes the full dependency closure a static export needs into `output`: every
  * JS-reachable module (`listResources`) unioned with the filtered non-JS assets a
  * package ships (`listPackageFiles`, kept to `ASSET_EXTENSIONS`). `listResources` alone
@@ -81,12 +98,19 @@ export async function materializeDeps(
     if (!isNpmSpecifier(specifier)) continue;
     const ref = toModuleRef(specifier);
 
-    for (const u of await server.listResources(ref)) urls.add(u);
+    for (const u of await server.listResources(ref)) {
+      if (!u.startsWith(basePath)) {
+        throw new Error(`cannot materialize ${u}: not under basePath "${basePath}"`);
+      }
+      urls.add(containedUrl(basePath, u.slice(basePath.length), "module"));
+    }
 
     // The union that makes the export actually work.
     const pkgRoot = packageRoot(url, basePath);
     for (const file of await server.listPackageFiles(ref)) {
-      if (ASSET_EXTENSIONS.some((ext) => file.endsWith(ext))) urls.add(pkgRoot + file);
+      if (ASSET_EXTENSIONS.some((ext) => file.endsWith(ext))) {
+        urls.add(containedUrl(pkgRoot, file, "package file"));
+      }
     }
   }
 

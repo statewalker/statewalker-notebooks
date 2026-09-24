@@ -1,6 +1,6 @@
 import { MemFilesApi } from "@statewalker/webrun-files-mem";
 import { describe, expect, it } from "vitest";
-import { ASSET_EXTENSIONS, materializeDeps } from "./deps.js";
+import { materializeDeps } from "./deps.js";
 
 /** Mirrors the real shape: listResources returns only the JS-reachable graph. */
 const fakeServer = () => ({
@@ -94,8 +94,38 @@ describe("materializeDeps", () => {
     expect(await output.exists("/_m/duck@1/README.md")).toBe(false);
   });
 
-  it("covers every extension class the stdlib libraries need", () => {
-    expect(ASSET_EXTENSIONS).toEqual(expect.arrayContaining([".wasm", ".woff2", ".css"]));
+  // Was: `expect(ASSET_EXTENSIONS).toEqual(expect.arrayContaining([...]))` — the constant
+  // asserted against itself, which passes for any value the constant happens to have and made
+  // the font/wasm coverage look tested exactly where it was not. Measure the behaviour instead:
+  // katex ships 24 `.woff2` and `.ttf` fonts that `listResources` never reports.
+  it("copies every extension class the stdlib libraries need, and nothing else", async () => {
+    const output = new MemFilesApi();
+    const fonts = {
+      ...fakeServer(),
+      listResources: async () => [],
+      listPackageFiles: async () => [
+        "dist/katex.min.css",
+        "dist/fonts/KaTeX_Main-Regular.woff2",
+        "dist/fonts/KaTeX_Main-Regular.woff",
+        "dist/fonts/KaTeX_Main-Regular.ttf",
+        "dist/katex.wasm",
+        "dist/katex.min.js.map",
+        "package.json",
+      ],
+    };
+    const written = await materializeDeps(
+      new Map([["npm:duck", "/_m/duck@1/dist/duckdb-browser.mjs"]]),
+      fonts as never,
+      output,
+      "/_m/",
+    );
+    expect(written.map((u) => u.replace("/_m/duck@1/dist/", "")).sort()).toEqual([
+      "fonts/KaTeX_Main-Regular.ttf",
+      "fonts/KaTeX_Main-Regular.woff",
+      "fonts/KaTeX_Main-Regular.woff2",
+      "katex.min.css",
+      "katex.wasm",
+    ]);
   });
 
   it("writes nothing when there are no pins", async () => {
@@ -130,6 +160,58 @@ describe("materializeDeps", () => {
     expect(await output.exists("/_m/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-eh.wasm")).toBe(true);
     expect(written).toContain("/_m/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-eh.wasm");
     expect(written).not.toContain("/_m/@duckdb/dist/duckdb-eh.wasm");
+  });
+
+  // `listPackageFiles` is the least controlled input this stage has — it is whatever the
+  // package's own tarball contains — and its entries are concatenated onto the package root
+  // and used as OUTPUT PATHS. Unresolved `..` walks out of the output root on a real backend.
+  it("refuses a package file that climbs out of the package root", async () => {
+    const output = new MemFilesApi();
+    const escaping = {
+      ...fakeServer(),
+      listPackageFiles: async () => ["../../../etc/passwd.css"],
+    };
+    await expect(
+      materializeDeps(
+        new Map([["npm:duck", "/_m/duck@1/dist/duckdb-browser.mjs"]]),
+        escaping as never,
+        output,
+        "/_m/",
+      ),
+    ).rejects.toThrow(/passwd\.css/);
+    expect(await output.exists("/_m/duck@1/../../../etc/passwd.css")).toBe(false);
+  });
+
+  it("refuses a resource URL that traverses out of the base path", async () => {
+    const output = new MemFilesApi();
+    const escaping = {
+      ...fakeServer(),
+      listResources: async () => ["/_m/duck@1/../../../etc/passwd.js"],
+    };
+    await expect(
+      materializeDeps(
+        new Map([["npm:duck", "/_m/duck@1/dist/duckdb-browser.mjs"]]),
+        escaping as never,
+        output,
+        "/_m/",
+      ),
+    ).rejects.toThrow(/passwd\.js/);
+  });
+
+  it("resolves `.` and `..` inside the package root rather than writing them literally", async () => {
+    const output = new MemFilesApi();
+    const nested = {
+      ...fakeServer(),
+      listResources: async () => [],
+      listPackageFiles: async () => ["dist/sub/../styles.css"],
+    };
+    await materializeDeps(
+      new Map([["npm:duck", "/_m/duck@1/dist/duckdb-browser.mjs"]]),
+      nested as never,
+      output,
+      "/_m/",
+    );
+    expect(await output.exists("/_m/duck@1/dist/styles.css")).toBe(true);
   });
 
   it("throws naming the offending URL when the package root cannot be parsed", async () => {

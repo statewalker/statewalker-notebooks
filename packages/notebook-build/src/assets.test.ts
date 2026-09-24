@@ -1,6 +1,11 @@
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { writeText } from "@statewalker/webrun-files";
 import { MemFilesApi } from "@statewalker/webrun-files-mem";
-import { describe, expect, it } from "vitest";
+import { NodeFilesApi } from "@statewalker/webrun-files-node";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { copyAttachments } from "./assets.js";
 import { parseMarkdown } from "./md-parse.js";
 
@@ -39,5 +44,70 @@ describe("copyAttachments", () => {
       '# T\n\n```js\nFileAttachment("d.csv");\n```\n\n```js\nFileAttachment("d.csv");\n```\n',
     );
     expect(await copyAttachments(nb, source, output, "/n.md")).toEqual(["/d.csv"]);
+  });
+});
+
+/**
+ * A REAL filesystem, not `MemFilesApi`. Mem keys its store on the literal path string, so
+ * `/nb/deep/../../x` is just an odd key there and nothing escapes; a real backend
+ * (`NodeFilesApi.resolvePath` is `rootDir + normalizePath(path)`, and `normalizePath` does
+ * not resolve `..`) hands the traversal straight to the OS.
+ */
+describe("copyAttachments — path containment", () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "nb-attachments-"));
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("refuses an attachment that climbs out of the notebook's directory", async () => {
+    // The two roots sit at different depths, so an escape out of the source root and an
+    // escape out of the output root land on two different files — and the write is visible.
+    const notebooksDir = join(root, "notebooks");
+    const outputDir = join(root, "deep", "out");
+    await mkdir(notebooksDir, { recursive: true });
+    await mkdir(outputDir, { recursive: true });
+    await writeFile(join(root, "secret.txt"), "TOP SECRET\n");
+
+    const source = new NodeFilesApi({ rootDir: notebooksDir });
+    const output = new NodeFilesApi({ rootDir: outputDir });
+    const nb = parseMarkdown('# T\n\n```js\nFileAttachment("../secret.txt");\n```\n');
+
+    await expect(copyAttachments(nb, source, output, "/report.md")).rejects.toThrow(
+      /\/report\.md.*\.\.\/secret\.txt/,
+    );
+    // …and nothing was written outside the output root on the way to failing.
+    expect(existsSync(join(root, "deep", "secret.txt"))).toBe(false);
+  });
+
+  it("refuses an attachment that climbs out of a nested notebook's own directory", async () => {
+    const notebooksDir = join(root, "notebooks");
+    const outputDir = join(root, "deep", "out");
+    await mkdir(join(notebooksDir, "nb", "deep"), { recursive: true });
+    await mkdir(outputDir, { recursive: true });
+    await writeFile(join(root, "secret.txt"), "TOP SECRET\n");
+
+    const source = new NodeFilesApi({ rootDir: notebooksDir });
+    const output = new NodeFilesApi({ rootDir: outputDir });
+    const nb = parseMarkdown('# T\n\n```js\nFileAttachment("../../../secret.txt");\n```\n');
+
+    await expect(copyAttachments(nb, source, output, "/nb/deep/report.md")).rejects.toThrow(
+      /secret\.txt/,
+    );
+    expect(existsSync(join(root, "deep", "secret.txt"))).toBe(false);
+  });
+
+  it("resolves `..` inside the notebook's directory instead of copying it literally", async () => {
+    const source = new MemFilesApi();
+    const output = new MemFilesApi();
+    await writeText(source, "/nb/data.csv", "a\n");
+    const nb = parseMarkdown('# T\n\n```js\nFileAttachment("sub/../data.csv");\n```\n');
+    // Left unresolved this is the key `/nb/sub/../data.csv`, which exists nowhere.
+    expect(await copyAttachments(nb, source, output, "/nb/index.md")).toEqual(["/nb/data.csv"]);
+    expect(await output.exists("/nb/data.csv")).toBe(true);
   });
 });
