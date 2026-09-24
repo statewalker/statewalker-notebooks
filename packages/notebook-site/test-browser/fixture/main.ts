@@ -3,6 +3,12 @@
 // `SiteHandler` behind a real ServiceWorker via `HostedSiteBuilder`. This is the whole point of
 // the browser test — proving the identical handler works unchanged in both hosts. Everything it
 // does is recorded on `window` so the Node-side Playwright test can read it back.
+//
+// "Behind", not "inside": `HostedSiteBuilder` builds a page-side `SwHttpAdapter` that holds the
+// handler, and the ServiceWorker's `SwHttpDispatcher` only relays intercepted `fetch` events to
+// it over a `MessagePort`. This module — and therefore `newNotebookSite` — runs in THIS page.
+// The handler crossing the SW request path unchanged is the claim; worker-scope execution is
+// not, and the DOM-free `lib` in `tsconfig.json` is a compile-time guard, not runtime proof.
 import { newPubSub } from "@statewalker/notebook-events";
 import { writeText } from "@statewalker/webrun-files";
 import { MemFilesApi } from "@statewalker/webrun-files-mem";

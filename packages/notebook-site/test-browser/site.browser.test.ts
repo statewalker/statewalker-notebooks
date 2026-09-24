@@ -1,5 +1,20 @@
 // Proves the central claim of `@statewalker/notebook-site`'s design: the SAME `SiteHandler`
-// that `src/site.test.ts` exercises under Node also runs, unchanged, in a real ServiceWorker.
+// that `src/site.test.ts` exercises under Node also runs, unchanged, BEHIND a real
+// ServiceWorker — hosted in the page, not in worker scope. Be precise about that, because the
+// stronger claim this comment used to make ("runs in a real ServiceWorker") is false:
+// `@statewalker/webrun-http-browser` splits the two halves. `SwHttpDispatcher` is what lives in
+// the worker, and all it does is intercept `fetch` and relay the request over a `MessagePort`.
+// `SwHttpAdapter` — a PAGE-side object — holds the registered handlers and is what invokes the
+// `SiteHandler`. Two proofs: a thrown error's stack points into the page bundle, and inserting
+// a `document.title` reference into `newNotebookSite` leaves all these tests green.
+//
+// So what this file demonstrates is the real, valuable thing — the handler survives the
+// ServiceWorker request path, the URL rewriting, the MessagePort round-trip and a real
+// `EventSource` — and not worker-scope execution. `tsconfig.json`'s DOM-free `lib` is a
+// COMPILE-TIME guard on the shipped package; it is not runtime proof that the handler never
+// touches the DOM, and this project's own rule is that compile checks are not runtime checks.
+// Nothing here executes `src/` in worker scope, and nothing should be read as if it did.
+//
 // Drives a real Chromium tab (via Playwright) against a real SW registered by
 // `@statewalker/webrun-site-host`'s `HostedSiteBuilder`, using `@statewalker/webrun-http-browser`'s
 // own published `sw-worker.js` — nothing here is faked. Reuses the fixture-server pattern from
@@ -18,7 +33,7 @@
 //   2. Every one of the three tests below was proven to go red against a deliberately broken
 //      handler before being trusted; see task-3-report.md for the transcripts.
 import { type Browser, chromium, type Page } from "playwright";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { startFixtureServer } from "./server.js";
 
 let browser: Browser;
@@ -56,9 +71,21 @@ afterAll(async () => {
   await stop?.();
 });
 
+beforeEach(() => {
+  // One page serves the whole suite, so these arrays accumulate across tests. Without this
+  // reset a single failing test fails every test after it, which turns one real defect into a
+  // wall of red that hides which request actually broke. Observed for real: reverting the
+  // path-decoding fix failed test 1 on its own assertion and then failed tests 2 and 3 purely
+  // on the leaked errors. Resetting here rather than in `afterEach` keeps the guard honest for
+  // errors raised during `beforeAll`.
+  consoleErrors.length = 0;
+  pageErrors.length = 0;
+});
+
 afterEach(() => {
   // The weak-channel guard: a broken handler that fails silently on a test's own assertions
-  // still has to get through this without leaving a trace on either error channel.
+  // still has to get through this without leaving a trace on either error channel. It now
+  // covers only THIS test's requests, which is what makes a failure locatable.
   expect(consoleErrors).toEqual([]);
   expect(pageErrors).toEqual([]);
 });
