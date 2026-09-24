@@ -64,4 +64,53 @@ describe("newDbClient", () => {
     // `of(source, name)` in notebook-kit accepts anything with a `sql` function.
     expect(typeof client.sql).toBe("function");
   });
+
+  // --- D2: BIGINT --------------------------------------------------------------------------
+  //
+  // DuckDB's `count(*)`, `sum()` over integers and any BIGINT column arrive as JavaScript
+  // `bigint` (proven against a real engine in `test-browser/duckdb.browser.test.ts`). A raw
+  // `bigint` crashes `JSON.stringify` at build time ("Do not know how to serialize a BigInt")
+  // and reaches notebook-kit's renderer unconverted at run time. The choice here is NUMBER,
+  // matching notebook-kit's own `revive` (`row[name] = Number(value)`), with the lossy range
+  // turned into a loud error instead of a silent rounding.
+  it("returns a BIGINT column as a number so a row is JSON-serializable", async () => {
+    const rows = await newDbClient(fakeDb([{ c: 3n } as never])).sql`SELECT count(*) AS c`;
+    expect(rows).toEqual([{ c: 3 }]);
+    expect(typeof (rows[0] as { c: unknown }).c).toBe("number");
+    expect(JSON.stringify(rows)).toBe('[{"c":3}]');
+  });
+
+  it("converts the largest exactly-representable BIGINT", async () => {
+    const rows = await newDbClient(fakeDb([{ c: 9007199254740991n } as never])).sql`SELECT 1`;
+    expect(rows).toEqual([{ c: 9007199254740991 }]);
+  });
+
+  // The boundary that must NOT silently corrupt. 2^53+1 is the smallest integer a double
+  // cannot hold: `Number(9007199254740993n)` is 9007199254740992 — off by one, with nothing
+  // in the output to say so.
+  it("refuses a BIGINT above Number.MAX_SAFE_INTEGER instead of rounding it", async () => {
+    await expect(
+      newDbClient(fakeDb([{ id: 9007199254740993n } as never])).sql`SELECT id FROM t`,
+    ).rejects.toThrow(/"id".*9007199254740993/s);
+  });
+
+  it("refuses a BIGINT below -Number.MAX_SAFE_INTEGER", async () => {
+    await expect(
+      newDbClient(fakeDb([{ id: -9007199254740993n } as never])).query("SELECT id FROM t"),
+    ).rejects.toThrow(/-9007199254740993/);
+  });
+
+  // DuckDB LIST/STRUCT columns nest, and a bigint one level down breaks JSON.stringify exactly
+  // the same way a top-level one does.
+  it("converts a BIGINT nested inside a list or struct column", async () => {
+    const rows = await newDbClient(fakeDb([{ ids: [1n, 2n], meta: { total: 3n } } as never]))
+      .sql`SELECT 1`;
+    expect(rows).toEqual([{ ids: [1, 2], meta: { total: 3 } }]);
+    expect(JSON.stringify(rows)).toBe('[{"ids":[1,2],"meta":{"total":3}}]');
+  });
+
+  it("leaves a value that is already a number untouched", async () => {
+    const rows = await newDbClient(fakeDb([{ n: 1.5, s: "a", b: true, z: null }])).sql`SELECT 1`;
+    expect(rows).toEqual([{ n: 1.5, s: "a", b: true, z: null }]);
+  });
 });

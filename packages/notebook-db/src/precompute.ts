@@ -1,6 +1,7 @@
 import type { FilesApi } from "@statewalker/webrun-files";
 import { dirname, joinPath, normalizePath, writeText } from "@statewalker/webrun-files";
 import type { NotebookDbClient } from "./client.js";
+import { normalizeRows } from "./rows.js";
 
 /**
  * One SQL cell to run at build time: the page it lives on, the database it targets, the
@@ -200,7 +201,11 @@ export async function precomputeQueries(
         request.strings as unknown as TemplateStringsArray,
         ...request.params,
       );
-      json = JSON.stringify(rows);
+      // `newDbClient` already did this, and the pass is idempotent — but `databases` is typed
+      // as the `NotebookDbClient` INTERFACE, so a caller's own implementation can hand back a
+      // raw `bigint` and `JSON.stringify` would throw "Do not know how to serialize a BigInt",
+      // naming neither the cell nor the query. Serialization defends itself.
+      json = JSON.stringify(normalizeRows(rows));
       serializedByQuery.set(relative, json);
     }
     const path = joinPath(pageDirectory(request.notebook), relative);

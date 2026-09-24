@@ -25,12 +25,14 @@ let fixture: FixtureServer;
 let page: Page;
 let runQueryScript: string;
 let injectionGuardScript: string;
+let bigintScript: string;
 
 beforeAll(async () => {
-  [fixture, runQueryScript, injectionGuardScript] = await Promise.all([
+  [fixture, runQueryScript, injectionGuardScript, bigintScript] = await Promise.all([
     startFixtureServer(PORT),
     readFile(join(here, "fixture", "run-query.page.js"), "utf8"),
     readFile(join(here, "fixture", "injection-guard.page.js"), "utf8"),
+    readFile(join(here, "fixture", "bigint.page.js"), "utf8"),
   ]);
   browser = await chromium.launch();
   page = await browser.newPage();
@@ -73,5 +75,27 @@ describe("live SQL against DuckDB-WASM", () => {
     );
     expect(result.matched).toBe(0);
     expect(result.tableRows[0]?.c).toBe(1); // the table survived
+  }, 120_000);
+
+  // (2) BIGINT, the defect a `::INTEGER` cast in the injection fixture used to hide.
+  it("turns a real BIGINT column into a JSON-serializable number", async () => {
+    await setBundles(fixture.bundles);
+    const r = await page.evaluate<{
+      rawType: string;
+      type: string;
+      value: unknown;
+      json: string;
+      overflow: string;
+    }>(bigintScript);
+
+    // The premise: without this, "the adapter returns a number" would be vacuously true.
+    expect(r.rawType).toBe("bigint");
+    // The fix: the adapter converts, and the result survives JSON.stringify — which is what
+    // the precompute stage does to it, and which THROWS on a bigint.
+    expect(r.type).toBe("number");
+    expect(r.value).toBe(3);
+    expect(r.json).toBe('[{"c":3}]');
+    // And the range a double cannot hold is an error naming the column, not a rounded value.
+    expect(r.overflow).toMatch(/"id".*9007199254740993/s);
   }, 120_000);
 });

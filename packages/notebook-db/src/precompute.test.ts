@@ -230,4 +230,39 @@ describe("precomputeQueries", () => {
     // The point of collapsing by query rather than by path: one execution, two files.
     expect(state.queries).toBe(1);
   });
+
+  // D2: `JSON.stringify` THROWS on a `bigint` ("Do not know how to serialize a BigInt"), with a
+  // message naming neither the cell nor the query. DuckDB's `count(*)` is BIGINT, so this took
+  // the whole build down on the most ordinary SQL cell there is.
+  it("serializes a BIGINT column from a hand-rolled client rather than crashing", async () => {
+    const output = new MemFilesApi();
+    // NOT `newDbClient`: `precomputeQueries` accepts any `NotebookDbClient`, so the
+    // serialization step has to be safe on its own and not lean on the adapter's conversion.
+    const raw = {
+      sql: async () => [{ c: 3n }] as never,
+      query: async () => [{ c: 3n }] as never,
+      close: async () => {},
+    };
+    const [path] = await precomputeQueries(
+      [{ notebook: "/index.html", database: "db", strings: ["SELECT count(*) AS c"], params: [] }],
+      new Map([["db", raw]]),
+      output,
+    );
+    expect(JSON.parse(await readText(output, path!))).toEqual([{ c: 3 }]);
+  });
+
+  it("refuses a BIGINT the JSON file could not hold exactly", async () => {
+    const raw = {
+      sql: async () => [{ id: 9007199254740993n }] as never,
+      query: async () => [] as never,
+      close: async () => {},
+    };
+    await expect(
+      precomputeQueries(
+        [{ notebook: "/index.html", database: "db", strings: ["SELECT id"], params: [] }],
+        new Map([["db", raw]]),
+        new MemFilesApi(),
+      ),
+    ).rejects.toThrow(/"id".*9007199254740993/s);
+  });
 });
