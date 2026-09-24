@@ -1,3 +1,4 @@
+import type { ColumnSchema } from "@observablehq/notebook-kit/runtime";
 import type { FilesApi } from "@statewalker/webrun-files";
 import { dirname, joinPath, normalizePath, writeText } from "@statewalker/webrun-files";
 import type { NotebookDbClient } from "./client.js";
@@ -160,6 +161,111 @@ export async function cachePathFor(
   return joinPath(pageDirectory(notebook), await relativeCachePath(database, strings, params));
 }
 
+// --- the revival directive ------------------------------------------------------------------
+//
+// notebook-kit's `DatabaseClient.sql()` is `fetch(path).then(r => r.json()).then(revive)`, and
+// `revive` (in the installed `runtime/stdlib/databaseClient.js`) starts with
+//
+//     function revive({rows, schema, date, ...meta}) { for (const column of schema) ... }
+//
+// so a bare `[...]` array throws `TypeError: schema is not iterable` on EVERY precomputed SQL
+// cell. The cache file must be the `{rows, schema}` envelope, which makes `schema` a field this
+// module has to produce.
+//
+// READ THIS BEFORE TRUSTING THE FIELD: what we emit is NOT SQL column-type metadata. This
+// package sits on `@statewalker/db-api`, which reports no SQL types, so we have none to report.
+// What we emit is a REVIVAL DIRECTIVE: a statement about which values need reconstructing after
+// a JSON round trip. That is legitimate to derive here because it is fully determined by the
+// JavaScript values we are about to serialize — it is an observation about our own output, not
+// a guess about the database. Anyone who later wants real SQL types must plumb them out of the
+// driver (`@statewalker/db-duckdb-browser`) and must not read them out of this field.
+//
+// What makes the directive reading sound: `revive`'s `switch (column.type)` has exactly two
+// cases, `"bigint"` and `"date"`. Every other type falls straight through and no value is
+// touched. So a type we emit either triggers a documented reconstruction or is inert; it can
+// never make `revive` do something we did not intend.
+//
+// "bigint" is one we never emit, and the reason is worth stating so nobody "fixes" it back in:
+// `normalizeRows` has already run over these rows (the adapter does it, and the call below does
+// it again defensively), so by serialization time every `bigint` is a `number` — or the pass
+// threw, for a value a JSON number could not hold exactly. Marking such a column `"bigint"`
+// would be false; the values are numbers. It is also pointless: `revive`'s `bigint` branch does
+// `row[name] = Number(value)`, which is precisely what `normalizeRows` already did, so for this
+// package's output that branch is unreachable AND a no-op. The conversion happens once, before
+// serialization, where an out-of-range value can still be refused loudly.
+
+/**
+ * The type tag for ONE value, or `undefined` for "no evidence" (null/undefined), which
+ * contributes nothing to the column's verdict.
+ *
+ * A `bigint` cannot reach here — `normalizeRows` runs first — and if one ever did,
+ * `JSON.stringify` would throw before any schema we wrote could be read, so it falls to
+ * `"other"` with the rest rather than earning a case that would be a lie.
+ */
+function columnTypeOf(value: unknown): ColumnSchema["type"] | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (value instanceof Date) return "date";
+  if (Array.isArray(value)) return "array";
+  switch (typeof value) {
+    case "string":
+      return "string";
+    case "number":
+      return "number";
+    case "boolean":
+      return "boolean";
+    case "object":
+      return "object";
+    default:
+      return "other";
+  }
+}
+
+/**
+ * Derives the revival directive from the rows themselves, scanning EVERY row per column rather
+ * than sampling the first.
+ *
+ * Three cases the first row cannot answer, and the ruling on each:
+ *
+ *  * **first row null** — a `Date` column whose first row is NULL is still a `Date` column.
+ *    Sampling row 0 would mark it `"other"` and the precomputed page would show a string where
+ *    the live page shows a `Date`. Every row is scanned, so the first non-null value decides.
+ *  * **every row null** — there is no value to reconstruct, so there is nothing for `revive` to
+ *    do and any type would be equally correct at runtime. We emit `"other"`, which is the
+ *    union's own name for "unclassified" and is inert in `revive`'s switch. Emitting a guess
+ *    like `"string"` would be the one thing this comment says we do not do: a claim about a
+ *    column we observed nothing about.
+ *  * **heterogeneous** — `revive` marks a COLUMN, not a value, so a column holding both a
+ *    `Date` and a `"hello"` has no marking that is right for both: `"date"` turns `"hello"`
+ *    into `Invalid Date`. The rule is therefore unanimity — a column is `"date"` only if EVERY
+ *    non-null value is a `Date` — and a mixed column is `"other"`, leaving each value exactly as
+ *    JSON delivered it. That is a real limitation of the cache format, not of this function: a
+ *    mixed column's `Date` values do arrive as strings, and the only cure is a per-value
+ *    encoding notebook-kit does not read. db-api rows come from typed SQL columns, so this is a
+ *    hand-rolled-client corner rather than something a notebook author meets.
+ *
+ * Column ORDER is first-seen across all rows, and the key set is the union rather than row 0's
+ * keys — a column absent from the first row still needs its directive.
+ */
+function deriveSchema(rows: unknown[]): ColumnSchema[] {
+  const verdicts = new Map<string, ColumnSchema["type"] | undefined>();
+  for (const row of rows) {
+    if (row === null || typeof row !== "object" || Array.isArray(row)) continue;
+    for (const [name, value] of Object.entries(row as Record<string, unknown>)) {
+      const observed = columnTypeOf(value);
+      if (!verdicts.has(name)) {
+        verdicts.set(name, observed);
+        continue;
+      }
+      if (observed === undefined) continue; // no evidence: never overrides a verdict
+      const current = verdicts.get(name);
+      // `undefined` here means "only nulls so far", so the first real value simply fills it in.
+      if (current === undefined) verdicts.set(name, observed);
+      else if (current !== observed) verdicts.set(name, "other"); // disagreement -> unanimity lost
+    }
+  }
+  return [...verdicts].map(([name, type]) => ({ name, type: type ?? "other" }));
+}
+
 /**
  * Runs every request against its named database and writes the rows as JSON at the path
  * notebook-kit's client will fetch at that request's page load.
@@ -205,7 +311,13 @@ export async function precomputeQueries(
       // as the `NotebookDbClient` INTERFACE, so a caller's own implementation can hand back a
       // raw `bigint` and `JSON.stringify` would throw "Do not know how to serialize a BigInt",
       // naming neither the cell nor the query. Serialization defends itself.
-      json = JSON.stringify(normalizeRows(rows));
+      const normalized = normalizeRows(rows);
+      // `{rows, schema}`, never a bare array: notebook-kit's `revive` destructures this object
+      // and iterates `schema`, so an array throws `TypeError: schema is not iterable` in the
+      // page. The schema is derived from `normalized` — AFTER the bigint pass — so it describes
+      // the values actually being serialized. See "the revival directive" above for what the
+      // field does and does not claim.
+      json = JSON.stringify({ rows: normalized, schema: deriveSchema(normalized) });
       serializedByQuery.set(relative, json);
     }
     const path = joinPath(pageDirectory(request.notebook), relative);

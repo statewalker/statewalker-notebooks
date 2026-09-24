@@ -162,7 +162,12 @@ describe("precomputeQueries", () => {
       output,
     );
     expect(written).toHaveLength(1);
-    expect(JSON.parse(await readText(output, written[0]!))).toEqual([{ n: 1 }, { n: 2 }]);
+    // `{rows, schema}`, not a bare array — notebook-kit's `revive` destructures this envelope.
+    // The round trip through the REAL `revive` is asserted in the D3 suite at the bottom.
+    expect(JSON.parse(await readText(output, written[0]!))).toEqual({
+      rows: [{ n: 1 }, { n: 2 }],
+      schema: [{ name: "n", type: "number" }],
+    });
   });
 
   it("reports a query naming a database that was not configured", async () => {
@@ -225,7 +230,7 @@ describe("precomputeQueries", () => {
     expect(written[0]).toMatch(/^\/\.observable\//);
     expect(written[1]).toMatch(/^\/reports\/\.observable\//);
     for (const path of written) {
-      expect(JSON.parse(await readText(output, path))).toEqual([{ n: 1 }]);
+      expect(JSON.parse(await readText(output, path)).rows).toEqual([{ n: 1 }]);
     }
     // The point of collapsing by query rather than by path: one execution, two files.
     expect(state.queries).toBe(1);
@@ -248,7 +253,12 @@ describe("precomputeQueries", () => {
       new Map([["db", raw]]),
       output,
     );
-    expect(JSON.parse(await readText(output, path!))).toEqual([{ c: 3 }]);
+    expect(JSON.parse(await readText(output, path!)).rows).toEqual([{ c: 3 }]);
+    // NOT "bigint": `normalizeRows` ran first, so what was serialized is a number, and
+    // `revive`'s bigint branch (`Number(value)`) would be a no-op on it anyway.
+    expect(JSON.parse(await readText(output, path!)).schema).toEqual([
+      { name: "c", type: "number" },
+    ]);
   });
 
   it("refuses a BIGINT the JSON file could not hold exactly", async () => {
@@ -264,5 +274,105 @@ describe("precomputeQueries", () => {
         new MemFilesApi(),
       ),
     ).rejects.toThrow(/"id".*9007199254740993/s);
+  });
+});
+
+// --- D3: the round trip through notebook-kit's REAL `revive` ---------------------------------
+//
+// Every test above reads the cache file with `JSON.parse` and stops there. The browser does
+// not: `DatabaseClient.sql()` is `response.json().then(revive)`, and `revive` destructures
+// `{rows, schema, ...}` and iterates `schema`. A bare array therefore throws
+// `TypeError: schema is not iterable` on EVERY precomputed SQL cell — a defect no `JSON.parse`
+// assertion can see. These tests feed the ACTUAL bytes `precomputeQueries` writes to the ACTUAL
+// installed `revive` and compare the result against what the LIVE client returns for the same
+// query, which is the isomorphism this package exists to preserve.
+
+/**
+ * The REAL, installed notebook-kit `DatabaseClient.revive`. Reached by module URL rather than
+ * by the public `@observablehq/notebook-kit/runtime` entry for a mechanical reason: that entry
+ * pulls in `runtime/stdlib/index.js`, whose module scope evaluates
+ * `document.querySelector("main")` and throws `ReferenceError: document is not defined` under
+ * Node. The module below has no DOM dependency; this is the same door `oracle` above uses.
+ */
+async function reviveFromNotebookKit(parsed: unknown): Promise<Record<string, unknown>[]> {
+  const entry = import.meta.resolve("@observablehq/notebook-kit");
+  const moduleUrl = new URL("./runtime/stdlib/databaseClient.js", entry).href;
+  const { DatabaseClient } = (await import(moduleUrl)) as {
+    DatabaseClient: { revive(value: unknown): Record<string, unknown>[] };
+  };
+  return DatabaseClient.revive(parsed);
+}
+
+/** A db whose `query` hands back FRESH row objects each call — `revive` mutates rows in place. */
+const freshDb = (make: () => Record<string, unknown>[]) =>
+  ({ query: async () => make(), exec: async () => {}, close: async () => {} }) as never;
+
+describe("the precomputed bytes survive notebook-kit's real revive", () => {
+  const strings = ["SELECT * FROM t"];
+
+  /** Writes the query and hands back both halves of the isomorphism. */
+  async function bothPaths(make: () => Record<string, unknown>[]) {
+    const output = new MemFilesApi();
+    const client = newDbClient(freshDb(make));
+    const [path] = await precomputeQueries(
+      [{ notebook: "/index.html", database: "db", strings, params: [] }],
+      new Map([["db", client]]),
+      output,
+    );
+    const bytes = await readText(output, path!);
+    const precomputed = await reviveFromNotebookKit(JSON.parse(bytes));
+    const live = await client.sql(strings as unknown as TemplateStringsArray);
+    return { bytes, precomputed, live };
+  }
+
+  it("revives a Date column back to a Date, matching the live client", async () => {
+    const { precomputed, live } = await bothPaths(() => [
+      { id: 1, name: "ada", at: new Date("2024-01-02T03:04:05.000Z") },
+      { id: 2, name: "grace", at: new Date("1999-12-31T23:59:59.000Z") },
+    ]);
+    // Spread both sides: `revive` returns the rows ARRAY with extra `schema`/`date` properties
+    // hung off it, and the claim under test is about the ROWS, not about those extras.
+    expect([...precomputed]).toEqual([...live]);
+    // Stated separately because it is the silent half: `toEqual` would already fail on a
+    // string-vs-Date mismatch, but nothing in the assertion above NAMES the type.
+    expect(precomputed[0]!.at).toBeInstanceOf(Date);
+    expect((precomputed[0]!.at as Date).toISOString()).toBe("2024-01-02T03:04:05.000Z");
+  });
+
+  it("revives a bigint column to the same number the live client returns", async () => {
+    const { precomputed, live } = await bothPaths(() => [{ c: 3n }]);
+    expect([...precomputed]).toEqual([...live]);
+    expect(precomputed[0]!.c).toBe(3);
+  });
+
+  it("finds a Date column whose FIRST row is null", async () => {
+    const { precomputed, live } = await bothPaths(() => [
+      { at: null },
+      { at: new Date("2024-06-01T00:00:00.000Z") },
+    ]);
+    expect([...precomputed]).toEqual([...live]);
+    expect(precomputed[0]!.at).toBeNull();
+    expect(precomputed[1]!.at).toBeInstanceOf(Date);
+  });
+
+  it("survives a column that is null in every row", async () => {
+    const { precomputed, live } = await bothPaths(() => [{ x: null }, { x: null }]);
+    expect([...precomputed]).toEqual([...live]);
+  });
+
+  it("leaves a heterogeneous column's non-Date values alone", async () => {
+    // A column holding both a Date and a string cannot round trip: `revive` is per-COLUMN, so
+    // marking it "date" would turn "hello" into `Invalid Date`. The rule is therefore "every
+    // non-null value is a Date, or the column is not marked", and this pins the second half.
+    const { precomputed } = await bothPaths(() => [
+      { mixed: new Date("2024-01-02T03:04:05.000Z") },
+      { mixed: "hello" },
+    ]);
+    expect(precomputed[1]!.mixed).toBe("hello");
+  });
+
+  it("round-trips an empty result", async () => {
+    const { precomputed, live } = await bothPaths(() => []);
+    expect([...precomputed]).toEqual([...live]);
   });
 });

@@ -56,6 +56,32 @@ Cast it in SQL (for example `CAST("id" AS VARCHAR)`) to keep the exact value.
 Nested `LIST` and `STRUCT` values are converted too; `Date`, `Uint8Array` and anything else
 carrying its own prototype is left untouched.
 
+## The precomputed cache file
+
+`precomputeQueries` writes each query's result at the page-relative path notebook-kit's
+`DatabaseClient.sql()` fetches, and writes it as the `{rows, schema}` envelope that client
+expects — never a bare array. `sql()` is `fetch(path).then(r => r.json()).then(revive)`, and
+`revive` destructures `{rows, schema, ...}` and iterates `schema`, so an array throws
+`TypeError: schema is not iterable` on every precomputed cell.
+
+`schema` here is a **revival directive**, not SQL column-type metadata: db-api reports no SQL
+types, and this field only says which values need reconstructing after a JSON round trip. It is
+derived by inspecting the values being serialized, and it matters for exactly one case —
+`revive` branches on `"bigint"` and `"date"` and ignores every other type. A `Date` column must
+be marked `"date"` or the precomputed page gets the ISO string where the live page gets a
+`Date`.
+
+Every row is scanned, not just the first, so a `Date` column whose first row is `NULL` is still
+found. A column that is `NULL` in every row is marked `"other"` (nothing observed, nothing to
+revive). A column is marked `"date"` only if *every* non-null value is a `Date`: `revive` marks
+a column rather than a value, so marking a mixed column would turn its non-dates into
+`Invalid Date`. Mixed columns therefore keep their JSON values verbatim, which means a `Date`
+inside one arrives as a string — a limit of the cache format, and not reachable from a typed
+SQL column.
+
+`"bigint"` is never emitted: the conversion above already ran, so those columns hold numbers by
+the time they are serialized.
+
 ## What this package does not do
 
 It does not implement SQL composition, dialect-specific identifier quoting, or view/CTE flattening.
