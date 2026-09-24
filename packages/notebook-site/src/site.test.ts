@@ -223,11 +223,17 @@ describe("newNotebookSite", () => {
     ).toThrow(/eventsPath/);
   });
 
-  it("mounts the events handler under /_events", async () => {
+  // The content-type alone cannot see the wiring: an endpoint that ignores `events` entirely
+  // and answers a hardcoded `text/event-stream` header passes it. `subscriberCount` is what
+  // requires the supplied PubSub to have been used — the SSE stream's `start` subscribes
+  // during construction, so the count is already 1 by the time the Response is returned.
+  it("mounts the events handler under /_events, backed by the supplied PubSub", async () => {
     const events = newPubSub();
     const handler = newNotebookSite({ output: await seededOutput(), events });
+    expect(events.subscriberCount("build")).toBe(0);
     const res = await handler(new Request("http://h/_events/build"));
     expect(res.headers.get("content-type")).toBe("text/event-stream");
+    expect(events.subscriberCount("build")).toBe(1);
     await res.body?.cancel();
   });
 
