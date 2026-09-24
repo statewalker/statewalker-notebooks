@@ -20,13 +20,15 @@
     "build": "tsdown",
     "prepack": "pnpm run build",
     "test": "pnpm run build && vitest run --passWithNoTests",
-    "typecheck": "tsc --noEmit"
+    "test:browser": "vitest run test-browser --config vitest.browser.config.ts",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test-browser.json"
   },
   "dependencies": {
     "@observablehq/notebook-kit": "^2.6.4"
   },
   "peerDependencies": {
     "@statewalker/db-api": "workspace:*",
+    "@statewalker/db-duckdb-browser": "workspace:*",
     "@statewalker/webrun-files": "workspace:*"
   },
   "peerDependenciesMeta": {
@@ -39,8 +41,13 @@
   },
   "devDependencies": {
     "@statewalker/db-api": "workspace:*",
+    "@statewalker/db-duckdb-browser": "workspace:*",
     "@statewalker/webrun-files": "workspace:*",
     "@statewalker/webrun-files-mem": "workspace:*",
+    "@statewalker/webrun-files-node": "workspace:*",
+    "@statewalker/webrun-modules": "workspace:*",
+    "esbuild": "^0.28.2",
+    "playwright": "^1.63.0",
     "tsdown": "^0.23.0",
     "typescript": "^7.0.2",
     "vitest": "^5.0.1"

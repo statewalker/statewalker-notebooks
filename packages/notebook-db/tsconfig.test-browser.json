@@ -1,0 +1,12 @@
+{
+  // `test-browser/` contains code that runs inside the page (`page.evaluate`), which reads
+  // `window` as a bare global — forbidden in `src/` (see `tsconfig.json`'s `WebWorker`-only
+  // `lib`, which has no `Window`). Its own project keeps that separation explicit; `pnpm
+  // typecheck` runs both.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ESNext", "WebWorker", "DOM"]
+  },
+  "include": ["./test-browser", "./*.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}
