@@ -28,16 +28,7 @@
   },
   "peerDependencies": {
     "@statewalker/db-api": "workspace:*",
-    "@statewalker/db-duckdb-browser": "workspace:*",
     "@statewalker/webrun-files": "workspace:*"
-  },
-  "peerDependenciesMeta": {
-    "@statewalker/db-duckdb-browser": {
-      "optional": true
-    },
-    "@statewalker/db-duckdb-node": {
-      "optional": true
-    }
   },
   "devDependencies": {
     "@statewalker/db-api": "workspace:*",
